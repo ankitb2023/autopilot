@@ -81,15 +81,18 @@ export class NaukriWorker implements AutomationWorker {
         // This is a generic approach for updating the Naukri profile.
         // Usually, clicking the 'Edit' icon on the Resume Headline and then clicking 'Save' is enough to trigger a "profile updated today" flag.
         try {
-          // Note: Selectors may change based on Naukri UI updates.
-          logger.info('waiting for resume headline section');
-          const editIcon = page.locator('span.edit.icon').first(); 
+          logger.info('waiting for Key skills section');
+          
+          // Target the specific "Key skills" widget header and its edit icon
+          const editIcon = page.locator('.widgetHead', { hasText: 'Key skills' }).locator('.edit.icon');
           
           await editIcon.waitFor({ state: 'visible', timeout: 15000 });
           await editIcon.click();
           
-          logger.info('clicked edit, waiting for save button');
-          const saveButton = page.locator('button:has-text("Save")').first();
+          logger.info('clicked edit, waiting for save button on Key skills modal');
+          
+          // Target the specific save button ID shown in the screenshot
+          const saveButton = page.locator('#saveKeySkills');
           await saveButton.waitFor({ state: 'visible', timeout: 5000 });
           await saveButton.click();
           

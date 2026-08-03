@@ -1,7 +1,7 @@
 import express from 'express';
 
 import { listProviders, updateProfile } from './controllers/automation.controller';
-import { initLogin, verifyOtp, tokenStatus } from './controllers/auth.controller';
+import { initLogin, verifyOtp, tokenStatus, storeToken } from './controllers/auth.controller';
 import { getSupportedProviders } from './automation/provider.registry';
 import { env } from './config/env';
 import { logger } from './config/logger';
@@ -60,6 +60,7 @@ app.get('/api/providers', listProviders);
 app.post('/api/auth/init-login', asyncHandler(initLogin));
 app.post('/api/auth/verify-otp', asyncHandler(verifyOtp));
 app.get('/api/auth/token-status', asyncHandler(tokenStatus));
+app.post('/api/auth/store-token', asyncHandler(storeToken));
 
 app.use(notFoundHandler);
 app.use(errorHandler);

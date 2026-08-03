@@ -1,0 +1,146 @@
+// AutoPilot — data model
+//
+// Scope discipline: this schema models what the roadmap actually needs and no
+// more. No soft deletes, no audit columns beyond timestamps, no polymorphic
+// tables. Provider and action are stored as strings rather than Postgres enums
+// on purpose — registering a new provider must not require a schema migration,
+// which is the same principle the provider registry enforces in code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ExecutionStatus {
+  PENDING
+  RUNNING
+  SUCCESS
+  FAILED
+  TIMEOUT
+}
+
+enum TriggerSource {
+  API
+  CRON
+  MANUAL
+}
+
+/// One automation run. Written by AutomationService in Phase 4 and read by the
+/// dashboard in Phase 6.
+model ExecutionHistory {
+  id String @id @default(uuid()) @db.Uuid
+
+  provider String /// e.g. "naukri" — matches ProviderId in code
+  action   String /// e.g. "profile.update"
+
+  status  ExecutionStatus @default(PENDING)
+  trigger TriggerSource   @default(API)
+
+  /// Correlates a row with the log lines emitted during the same run.
+  requestId String?
+
+  /// Human-readable outcome; the worker's message, or the failure reason.
+  message String?
+
+  /// Stable machine code on failure (see ErrorCode). Lets the dashboard group
+  /// failures by cause without string matching.
+  errorCode String?
+
+  durationMs Int?
+
+  /// Provider-specific payload: fields changed, screenshot paths (Phase 3), etc.
+  /// JSON rather than columns because its shape is per-provider by nature.
+  details Json?
+
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  notifications Notification[]
+
+  /// Indexes chosen for the two real queries: the dashboard's reverse-chronological
+  /// feed, and "latest run for provider X".
+  @@index([createdAt(sort: Desc)])
+  @@index([provider, createdAt(sort: Desc)])
+  @@index([status])
+  @@map("execution_history")
+}
+
+/// Key/value application configuration that must outlive a deploy and be
+/// editable at runtime (e.g. schedule toggles, per-provider enable flags).
+/// Secrets stay in environment variables — never here.
+model Setting {
+  id String @id @default(uuid()) @db.Uuid
+
+  key         String  @unique
+  value       Json
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+/// Reserved for authentication (a later phase). AutoPilot is single-tenant today;
+/// the table exists so execution history can be attributed without a rewrite.
+model User {
+  id String @id @default(uuid()) @db.Uuid
+
+  email        String  @unique
+  name         String?
+  passwordHash String?
+  isActive     Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+enum NotificationChannel {
+  EMAIL
+  PUSH
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+/// Outbound notification record (Phase 5 email, Phase 8 push).
+///
+/// Persisted rather than fire-and-forget so a failed send is retryable and
+/// visible in the dashboard — an automation that silently stopped emailing is
+/// indistinguishable from one that stopped running.
+model Notification {
+  id String @id @default(uuid()) @db.Uuid
+
+  channel NotificationChannel
+  status  NotificationStatus  @default(PENDING)
+
+  recipient String
+  subject   String?
+  body      String?
+
+  error       String?
+  attempts    Int       @default(0)
+  dispatchedAt DateTime?
+
+  executionId String?           @db.Uuid
+  execution   ExecutionHistory? @relation(fields: [executionId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([executionId])
+  @@map("notifications")
+}

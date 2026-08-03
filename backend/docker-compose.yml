@@ -1,0 +1,65 @@
+# Local development stack.
+#
+# Production uses Render (app) + Neon (Postgres); this file exists so the project
+# can be run and demoed with no cloud account, and so a new machine is one command
+# away from a working environment.
+#
+#   docker compose up --build
+#
+# The api service waits for Postgres to be genuinely accepting connections
+# (service_healthy, not just "container started") and applies migrations on boot,
+# so a fresh clone comes up with a correct schema.
+
+name: autopilot
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: autopilot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: autopilot
+      POSTGRES_PASSWORD: autopilot
+      POSTGRES_DB: autopilot
+    ports:
+      # Exposed so `npm run dev` on the host, and Prisma Studio, can connect.
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U autopilot -d autopilot']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: autopilot-api
+    restart: unless-stopped
+    # PID 1 signal handling and zombie reaping — required for the graceful
+    # shutdown path in server.ts to be exercised correctly.
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      HOST: 0.0.0.0
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://autopilot:autopilot@postgres:5432/autopilot?schema=public
+      CORS_ORIGINS: '*'
+      EXECUTION_TIMEOUT_MS: 120000
+    ports:
+      - '8080:8080'
+    # Migrations are applied as a release step, then the server starts. In Render
+    # this same command becomes the pre-deploy command.
+    command: >
+      sh -c "npx prisma migrate deploy && node --enable-source-maps dist/server.js"
+
+volumes:
+  postgres-data:

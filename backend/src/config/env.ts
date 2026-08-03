@@ -25,6 +25,12 @@ const schema = z.object({
 
   /** Hard ceiling on one automation run. Raise in Phase 3 — Playwright is slower. */
   EXECUTION_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+
+  /** 
+   * JSON string of session cookies for Naukri.
+   * Acquired by exporting cookies from a logged-in browser session.
+   */
+  NAUKRI_COOKIES: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);

@@ -93,7 +93,7 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
 
   try {
     const verifyResponse = await globalThis.fetch(
-      'https://www.naukri.com/central-login-services/v1/login/otp/verify',
+      'https://www.naukri.com/central-login-services/v1/login',
       {
         method: 'POST',
         headers: {

@@ -27,14 +27,19 @@ const schema = z.object({
   EXECUTION_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
 
   /** 
-   * JSON string of session cookies for Naukri.
-   * Acquired by exporting cookies from a logged-in browser session.
+   * JSON string of session cookies for Naukri (legacy, not used in API mode).
    */
   NAUKRI_COOKIES: z.string().optional(),
 
-  /** Login credentials for standard authentication fallback */
+  /** Login credentials for Naukri API authentication */
   NAUKRI_EMAIL: z.string().optional(),
   NAUKRI_PASSWORD: z.string().optional(),
+
+  /** Profile hash ID — get from browser Network tab when saving profile */
+  NAUKRI_PROFILE_ID: z.string().optional(),
+
+  /** Comma-separated key skills string to re-save */
+  NAUKRI_KEY_SKILLS: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);

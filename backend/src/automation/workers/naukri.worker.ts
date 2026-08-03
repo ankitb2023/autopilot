@@ -1,4 +1,3 @@
-import { chromium, type Browser } from 'playwright';
 import type {
   AutomationAction,
   AutomationWorker,
@@ -6,220 +5,113 @@ import type {
   ProviderId,
   WorkerOutcome,
 } from '../types';
-import { env } from '../../config/env'; // Assuming env has credentials, or we will add them later
+import { env } from '../../config/env';
 
 /**
- * Naukri automation worker — Phase 3 (Playwright).
+ * Naukri automation worker — Direct API approach.
+ * 
+ * Instead of launching a browser (which gets blocked by Akamai WAF on cloud servers),
+ * this worker calls Naukri's internal REST APIs directly:
+ * 1. Logs in via the login API to get a fresh JWT Bearer token
+ * 2. Calls the profile update API to re-save Key Skills (triggers "profile updated today")
  */
 export class NaukriWorker implements AutomationWorker {
   readonly provider: ProviderId = 'naukri';
   readonly supportedActions: readonly AutomationAction[] = ['profile.update'];
 
   async execute({ logger, dryRun, signal }: ExecutionContext): Promise<WorkerOutcome> {
-    logger.info('naukri worker starting', { dryRun });
+    logger.info('naukri worker starting (API mode)', { dryRun });
     signal.throwIfAborted();
 
-    let browser: Browser | null = null;
     try {
-      logger.info('launching browser');
-      browser = await chromium.launch({
-        headless: env.NODE_ENV === 'production',
-        args: [
-          '--no-sandbox', 
-          '--disable-setuid-sandbox', 
-          '--disable-dev-shm-usage',
-          '--disable-blink-features=AutomationControlled'
-        ],
-      });
-      signal.throwIfAborted();
+      // ── Step 1: Authenticate ─────────────────────────────────────────
+      let bearerToken: string | null = null;
 
-      let cookies = [];
-      if (env.NAUKRI_COOKIES) {
-        try {
-          cookies = JSON.parse(env.NAUKRI_COOKIES);
-          logger.info('parsed NAUKRI_COOKIES from environment');
-        } catch (e) {
-          throw new Error('NAUKRI_COOKIES is not valid JSON. Ensure you exported cookies correctly.');
-        }
-      } else {
-        logger.warn('NAUKRI_COOKIES not provided. Attempting to run without session (will likely hit login).');
+      if (env.NAUKRI_EMAIL && env.NAUKRI_PASSWORD) {
+        logger.info('logging in via Naukri API to get fresh token');
+        bearerToken = await this.loginViaApi(env.NAUKRI_EMAIL, env.NAUKRI_PASSWORD, logger);
       }
 
-      const context = await browser.newContext({
-        viewport: { width: 1280, height: 720 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        javaScriptEnabled: true,
-        extraHTTPHeaders: {
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-          'sec-ch-ua-mobile': '?0',
-          'sec-ch-ua-platform': '"Windows"',
-          'Upgrade-Insecure-Requests': '1',
-          'Sec-Fetch-Dest': 'document',
-          'Sec-Fetch-Mode': 'navigate',
-          'Sec-Fetch-Site': 'none',
-          'Sec-Fetch-User': '?1'
-        }
-      });
-      
-      if (cookies.length > 0) {
-        // Sanitize cookies because Chrome extensions sometimes export invalid Playwright formats
-        const sanitizedCookies = cookies.map((cookie: any) => {
-          if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
-            if (cookie.sameSite.toLowerCase() === 'no_restriction') cookie.sameSite = 'None';
-            else if (cookie.sameSite.toLowerCase() === 'lax') cookie.sameSite = 'Lax';
-            else if (cookie.sameSite.toLowerCase() === 'strict') cookie.sameSite = 'Strict';
-            else delete cookie.sameSite;
-          }
-          return cookie;
-        });
-
-        await context.addCookies(sanitizedCookies);
-        logger.info('injected session cookies into browser context');
-      }
-
-      const page = await context.newPage();
-      
-      // 1. Inject anti-bot scripts as a raw string so TypeScript (Node.js) doesn't complain about 'window'
-      await page.addInitScript(`
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-          parameters.name === 'notifications' ?
-            Promise.resolve({ state: Notification.permission }) :
-            originalQuery(parameters)
-        );
-      `);
-      
-      logger.info('navigating to homepage first (referrer spoofing)');
-      await page.goto('https://www.naukri.com/', { waitUntil: 'domcontentloaded' });
-      await page.waitForTimeout(2000);
-      
-      if (cookies.length === 0 && env.NAUKRI_EMAIL && env.NAUKRI_PASSWORD) {
-        logger.info('no cookies provided, attempting standard email/password login');
-        await page.goto('https://www.naukri.com/nlogin/login', { waitUntil: 'domcontentloaded' });
-        
-        try {
-          // Wait for login fields and fill them slowly to mimic human typing
-          await page.locator('#usernameField').waitFor({ state: 'visible', timeout: 10000 });
-          await page.locator('#usernameField').type(env.NAUKRI_EMAIL, { delay: 100 });
-          
-          await page.locator('#passwordField').type(env.NAUKRI_PASSWORD, { delay: 100 });
-          
-          logger.info('credentials entered, clicking login button');
-          await page.locator('button[type="submit"]').first().click();
-          
-          // Wait for navigation after login
-          await page.waitForTimeout(5000);
-        } catch (loginError: any) {
-          logger.warn('Failed during login sequence (WAF block or CAPTCHA). Taking screenshot.', { error: loginError.message });
-          let screenshotBase64 = '';
-          try {
-            await page.waitForTimeout(2000); // let any bot-blocker fully render
-            const buffer = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: true });
-            screenshotBase64 = buffer.toString('base64');
-          } catch (e) {}
-
-          return {
-            success: false,
-            message: `Login failed: ${loginError.message}`,
-            details: {
-              url: page.url(),
-              screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : 'Failed to capture'
-            }
-          };
-        }
-      }
-      
-      logger.info('navigating to naukri profile page');
-      await page.goto('https://www.naukri.com/mnjuser/profile', { waitUntil: 'domcontentloaded' });
-      signal.throwIfAborted();
-      
-      // Give React some time to render the initial DOM just in case
-      await page.waitForTimeout(3000);
-      
-      // Check if we were redirected to login page due to expired cookies or failed login
-      if (page.url().includes('login')) {
-        let screenshotBase64 = '';
-        try {
-          // Wait an extra 2 seconds before screenshot so we can capture any CAPTCHAs that might be rendering
-          await page.waitForTimeout(2000);
-          const buffer = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: true });
-          screenshotBase64 = buffer.toString('base64');
-          logger.info('captured login failure screenshot');
-        } catch (screenshotError) {
-          logger.error('failed to capture login failure screenshot', { error: String(screenshotError) });
-        }
-
+      if (!bearerToken) {
         return {
           success: false,
-          message: 'Login failed or redirected to login page. Check screenshot for CAPTCHA.',
+          message: 'Failed to obtain bearer token. Check NAUKRI_EMAIL and NAUKRI_PASSWORD.',
+          details: {},
+        };
+      }
+
+      logger.info('successfully obtained bearer token');
+      signal.throwIfAborted();
+
+      if (dryRun) {
+        logger.info('dry run: skipping actual profile update');
+        return { success: true, message: 'Dry run completed — login successful.', details: { dryRun: true } };
+      }
+
+      // ── Step 2: Update profile via API ───────────────────────────────
+      const keySkills = env.NAUKRI_KEY_SKILLS 
+        || 'Core Java Programming,React.js,Javascript,Redux,Spring Boot,Elastic Search,Kibana,Redis,SQL,DBMS,HTML,CSS,Software Development,Software Engineering,GIT,TypeScript,Nextjs,Data Structures and Algorithms,System Design,Jenkins,Rest API Design';
+
+      const profileId = env.NAUKRI_PROFILE_ID;
+      if (!profileId) {
+        return {
+          success: false,
+          message: 'NAUKRI_PROFILE_ID is not set. Get it from browser Network tab when saving profile.',
+          details: {},
+        };
+      }
+
+      logger.info('calling Naukri profile update API');
+
+      const updateResponse = await fetch(
+        'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles',
+        {
+          method: 'POST',
+          headers: {
+            'accept': 'application/json',
+            'content-type': 'application/json',
+            'authorization': `Bearer ${bearerToken}`,
+            'appid': '105',
+            'clientid': 'd3skt0p',
+            'systemid': 'Naukri',
+            'x-http-method-override': 'PUT',
+            'x-requested-with': 'XMLHttpRequest',
+            'origin': 'https://www.naukri.com',
+            'referer': 'https://www.naukri.com/mnjuser/profile',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+          },
+          body: JSON.stringify({
+            profile: { keySkills },
+            profileId,
+          }),
+        }
+      );
+
+      const responseText = await updateResponse.text();
+      logger.info('profile update response', { 
+        status: updateResponse.status, 
+        body: responseText.substring(0, 500) 
+      });
+
+      if (updateResponse.ok) {
+        return {
+          success: true,
+          message: 'Naukri profile updated successfully via API!',
           details: { 
-            dryRun, 
-            url: page.url(),
-            screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : 'Failed to capture' 
+            status: updateResponse.status, 
+            response: responseText.substring(0, 200) 
+          },
+        };
+      } else {
+        return {
+          success: false,
+          message: `Profile update API returned ${updateResponse.status}`,
+          details: { 
+            status: updateResponse.status, 
+            body: responseText.substring(0, 500) 
           },
         };
       }
-      
-      if (dryRun) {
-        logger.info('dry run: skipping actual profile update actions');
-      } else {
-        logger.info('updating profile (simulating activity)');
-        
-        try {
-          logger.info('waiting for Key skills section');
-          
-          // Target the specific "Key skills" widget using its ID container
-          const editIcon = page.locator('#lazyKeySkills .edit.icon');
-          
-          await editIcon.waitFor({ state: 'visible', timeout: 15000 });
-          await editIcon.click();
-          
-          logger.info('clicked edit, waiting for save button on Key skills modal');
-          
-          // Target the specific save button ID shown in the screenshot
-          const saveButton = page.locator('#saveKeySkills');
-          await saveButton.waitFor({ state: 'visible', timeout: 5000 });
-          await saveButton.click();
-          
-          logger.info('saved profile successfully');
-          // Wait for save operation to complete
-          await page.waitForTimeout(3000); 
-        } catch (e: any) {
-          logger.warn('could not execute the exact edit/save sequence. Taking screenshot and continuing.', { error: e.message });
-          logger.warn(`Debug info - Current URL: ${page.url()}`);
-          
-          let screenshotBase64 = '';
-          try {
-            // Wait an extra 2 seconds before screenshot to ensure the page isn't just loading slowly
-            await page.waitForTimeout(2000);
-            const buffer = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: true });
-            screenshotBase64 = buffer.toString('base64');
-            logger.info('captured debug screenshot');
-          } catch (screenshotError) {
-            logger.error('failed to capture screenshot', { error: String(screenshotError) });
-          }
-
-          return {
-            success: false,
-            message: `Failed to find or click Key skills section: ${e.message}`,
-            details: { 
-              dryRun, 
-              url: page.url(),
-              screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : 'Failed to capture' 
-            },
-          };
-        }
-      }
-
-      return {
-        success: true,
-        message: 'Naukri profile updated successfully.',
-        details: { dryRun },
-      };
     } catch (error: any) {
       logger.error('naukri worker failed', { error: error.message, stack: error.stack });
       return {
@@ -227,11 +119,73 @@ export class NaukriWorker implements AutomationWorker {
         message: 'Failed to update Naukri profile',
         details: { error: error.message },
       };
-    } finally {
-      if (browser) {
-        logger.info('closing browser');
-        await browser.close().catch(e => logger.error('failed to close browser', { error: e.message }));
+    }
+  }
+
+  /**
+   * Login to Naukri via their internal API and extract the JWT access token.
+   */
+  private async loginViaApi(email: string, password: string, logger: any): Promise<string | null> {
+    try {
+      const loginResponse = await fetch(
+        'https://www.naukri.com/central-login-services/v1/login',
+        {
+          method: 'POST',
+          headers: {
+            'accept': 'application/json',
+            'content-type': 'application/json',
+            'appid': '105',
+            'systemid': 'Naukri',
+            'clientid': 'd3skt0p',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+            'origin': 'https://www.naukri.com',
+            'referer': 'https://www.naukri.com/nlogin/login',
+          },
+          body: JSON.stringify({ username: email, password }),
+        }
+      );
+
+      logger.info('login API response status', { status: loginResponse.status });
+
+      if (!loginResponse.ok) {
+        const errorBody = await loginResponse.text();
+        logger.error('login API failed', { status: loginResponse.status, body: errorBody.substring(0, 500) });
+        return null;
       }
+
+      // Try to get the token from the response body
+      const data = await loginResponse.json();
+      
+      // Naukri login API typically returns the token in one of these fields
+      const token = data?.token || data?.accessToken || data?.access_token || data?.cookies?.nauk_at;
+      
+      if (token) {
+        logger.info('extracted token from login response body');
+        return token;
+      }
+
+      // Fallback: check Set-Cookie headers for nauk_at
+      const setCookies = loginResponse.headers.getSetCookie?.() || [];
+      for (const cookie of setCookies) {
+        if (cookie.startsWith('nauk_at=')) {
+          const tokenValue = cookie.split('nauk_at=')[1]?.split(';')[0];
+          if (tokenValue) {
+            logger.info('extracted token from Set-Cookie header');
+            return tokenValue;
+          }
+        }
+      }
+
+      // Last resort: log what we got so user can help debug
+      logger.warn('could not find token in login response', { 
+        bodyKeys: Object.keys(data),
+        setCookieCount: setCookies.length,
+        responsePreview: JSON.stringify(data).substring(0, 300)
+      });
+      return null;
+    } catch (error: any) {
+      logger.error('login API error', { error: error.message });
+      return null;
     }
   }
 }

@@ -76,10 +76,29 @@ export class NaukriWorker implements AutomationWorker {
 
       const page = await context.newPage();
       
-      logger.info('navigating to naukri profile page directly');
-      // Navigating directly to profile page since we injected session cookies
+      // 1. Inject anti-bot scripts to hide the fact that we are using a headless browser
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        (window as any).chrome = { runtime: {} };
+        // Overwrite permissions to avoid headless leak
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters: any) => (
+          parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission } as PermissionStatus) :
+            originalQuery(parameters)
+        );
+      });
+      
+      logger.info('navigating to homepage first (referrer spoofing)');
+      await page.goto('https://www.naukri.com/', { waitUntil: 'domcontentloaded' });
+      await page.waitForTimeout(2000);
+      
+      logger.info('navigating to naukri profile page');
       await page.goto('https://www.naukri.com/mnjuser/profile', { waitUntil: 'domcontentloaded' });
       signal.throwIfAborted();
+      
+      // Give React some time to render the initial DOM just in case
+      await page.waitForTimeout(3000);
       
       // Check if we were redirected to login page due to expired cookies
       if (page.url().includes('login')) {
@@ -91,8 +110,6 @@ export class NaukriWorker implements AutomationWorker {
       } else {
         logger.info('updating profile (simulating activity)');
         
-        // This is a generic approach for updating the Naukri profile.
-        // Usually, clicking the 'Edit' icon on the Resume Headline and then clicking 'Save' is enough to trigger a "profile updated today" flag.
         try {
           logger.info('waiting for Key skills section');
           
@@ -118,7 +135,9 @@ export class NaukriWorker implements AutomationWorker {
           
           let screenshotBase64 = '';
           try {
-            const buffer = await page.screenshot({ type: 'jpeg', quality: 50 });
+            // Wait an extra 2 seconds before screenshot to ensure the page isn't just loading slowly
+            await page.waitForTimeout(2000);
+            const buffer = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: true });
             screenshotBase64 = buffer.toString('base64');
             logger.info('captured debug screenshot');
           } catch (screenshotError) {

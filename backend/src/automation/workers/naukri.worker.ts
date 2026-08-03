@@ -76,18 +76,17 @@ export class NaukriWorker implements AutomationWorker {
 
       const page = await context.newPage();
       
-      // 1. Inject anti-bot scripts to hide the fact that we are using a headless browser
-      await page.addInitScript(() => {
+      // 1. Inject anti-bot scripts as a raw string so TypeScript (Node.js) doesn't complain about 'window'
+      await page.addInitScript(`
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        (window as any).chrome = { runtime: {} };
-        // Overwrite permissions to avoid headless leak
+        window.chrome = { runtime: {} };
         const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters: any) => (
+        window.navigator.permissions.query = (parameters) => (
           parameters.name === 'notifications' ?
-            Promise.resolve({ state: Notification.permission } as PermissionStatus) :
+            Promise.resolve({ state: Notification.permission }) :
             originalQuery(parameters)
         );
-      });
+      `);
       
       logger.info('navigating to homepage first (referrer spoofing)');
       await page.goto('https://www.naukri.com/', { waitUntil: 'domcontentloaded' });

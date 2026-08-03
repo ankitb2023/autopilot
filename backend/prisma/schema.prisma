@@ -1,10 +1,11 @@
 // AutoPilot — data model
 //
-// Scope discipline: this schema models what the roadmap actually needs and no
-// more. No soft deletes, no audit columns beyond timestamps, no polymorphic
-// tables. Provider and action are stored as strings rather than Postgres enums
-// on purpose — registering a new provider must not require a schema migration,
-// which is the same principle the provider registry enforces in code.
+// Only what Phases 2–4 actually need. Settings, Users and Notifications arrive with
+// the phases that use them; empty tables are just maintenance.
+//
+// Provider and action are stored as strings, not Postgres enums, so registering a
+// new provider never requires a migration — the same principle the provider
+// registry enforces in code.
 
 generator client {
   provider = "prisma-client-js"
@@ -16,7 +17,6 @@ datasource db {
 }
 
 enum ExecutionStatus {
-  PENDING
   RUNNING
   SUCCESS
   FAILED
@@ -29,118 +29,65 @@ enum TriggerSource {
   MANUAL
 }
 
-/// One automation run. Written by AutomationService in Phase 4 and read by the
-/// dashboard in Phase 6.
+/// One automation run. Written by the service in Phase 4, read by the dashboard later.
 model ExecutionHistory {
   id String @id @default(uuid()) @db.Uuid
 
   provider String /// e.g. "naukri" — matches ProviderId in code
   action   String /// e.g. "profile.update"
 
-  status  ExecutionStatus @default(PENDING)
+  status  ExecutionStatus
   trigger TriggerSource   @default(API)
 
-  /// Correlates a row with the log lines emitted during the same run.
-  requestId String?
-
-  /// Human-readable outcome; the worker's message, or the failure reason.
+  /// The worker's message, or the failure reason.
   message String?
 
-  /// Stable machine code on failure (see ErrorCode). Lets the dashboard group
-  /// failures by cause without string matching.
+  /// Stable machine code on failure, so failures can be grouped without string
+  /// matching.
   errorCode String?
 
   durationMs Int?
 
-  /// Provider-specific payload: fields changed, screenshot paths (Phase 3), etc.
-  /// JSON rather than columns because its shape is per-provider by nature.
+  /// Provider-specific payload: fields changed, screenshot paths (Phase 3).
+  /// JSON because its shape is per-provider by nature.
   details Json?
 
-  startedAt  DateTime  @default(now())
-  finishedAt DateTime?
+  startedAt  DateTime  @default(now()) @db.Timestamptz(3)
+  finishedAt DateTime? @db.Timestamptz(3)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  notifications Notification[]
-
-  /// Indexes chosen for the two real queries: the dashboard's reverse-chronological
-  /// feed, and "latest run for provider X".
-  @@index([createdAt(sort: Desc)])
-  @@index([provider, createdAt(sort: Desc)])
-  @@index([status])
+  /// Indexed for the two real queries: a reverse-chronological feed, and
+  /// "latest run for provider X".
+  @@index([startedAt(sort: Desc)])
+  @@index([provider, startedAt(sort: Desc)])
   @@map("execution_history")
 }
 
-/// Key/value application configuration that must outlive a deploy and be
-/// editable at runtime (e.g. schedule toggles, per-provider enable flags).
-/// Secrets stay in environment variables — never here.
-model Setting {
-  id String @id @default(uuid()) @db.Uuid
-
-  key         String  @unique
-  value       Json
-  description String?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@map("settings")
-}
-
-/// Reserved for authentication (a later phase). AutoPilot is single-tenant today;
-/// the table exists so execution history can be attributed without a rewrite.
-model User {
-  id String @id @default(uuid()) @db.Uuid
-
-  email        String  @unique
-  name         String?
-  passwordHash String?
-  isActive     Boolean @default(true)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@map("users")
-}
-
-enum NotificationChannel {
-  EMAIL
-  PUSH
-}
-
-enum NotificationStatus {
-  PENDING
-  SENT
-  FAILED
-}
-
-/// Outbound notification record (Phase 5 email, Phase 8 push).
+/// Mutual-exclusion lease for automation runs — one row per lock key (per provider).
+/// A concurrent run for the same key is rejected with 409 rather than driving a
+/// second browser session into the same account.
 ///
-/// Persisted rather than fire-and-forget so a failed send is retryable and
-/// visible in the dashboard — an automation that silently stopped emailing is
-/// indistinguishable from one that stopped running.
-model Notification {
-  id String @id @default(uuid()) @db.Uuid
+/// See src/automation/execution.lock.ts for why this is a lease row rather than a
+/// Postgres advisory lock.
+model AutomationLock {
+  /// Lock key, e.g. "naukri". Natural primary key: one row per lock by definition.
+  key String @id
 
-  channel NotificationChannel
-  status  NotificationStatus  @default(PENDING)
+  /// The run holding the lease. Release only deletes its own row, so a run whose
+  /// lease already expired cannot release its successor's lock.
+  executionId String @db.Uuid
 
-  recipient String
-  subject   String?
-  body      String?
+  /// Denormalised for readability when inspecting a live lock. Never used for locking.
+  trigger TriggerSource @default(API)
 
-  error       String?
-  attempts    Int       @default(0)
-  dispatchedAt DateTime?
+  /// Timestamptz, unlike Prisma's default `timestamp(3)`. This is the one table
+  /// written with raw SQL, and `now()` returns timestamptz — storing that into a
+  /// tz-less column silently converts to the connection's local time and reads back
+  /// as UTC, skewing the lease by the server's UTC offset.
+  acquiredAt DateTime @default(now()) @db.Timestamptz(3)
 
-  executionId String?           @db.Uuid
-  execution   ExecutionHistory? @relation(fields: [executionId], references: [id], onDelete: SetNull)
+  /// Lease expiry, always on the database clock. A crashed process's lock self-heals
+  /// once this passes; nothing has to clean up after it.
+  expiresAt DateTime @db.Timestamptz(3)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([status, createdAt])
-  @@index([executionId])
-  @@map("notifications")
+  @@map("automation_locks")
 }

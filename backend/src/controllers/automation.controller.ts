@@ -1,46 +1,38 @@
 import type { Request, Response } from 'express';
 
-import { automationService } from '../automation/automation.service';
+import { executeAutomation } from '../automation/automation.service';
 import { describeProviders } from '../automation/provider.registry';
-import { sendSuccess } from '../core/httpResponse';
-import { validatedBody } from '../middleware/validate';
-import { updateProfileBodySchema } from '../validation/automation.schema';
+import { updateProfileSchema } from '../validation/automation.schema';
 
 /**
  * HTTP adapter for the automation engine.
  *
- * Contains no automation logic and — critically — no provider names. Its entire
- * job is: read validated input, name the action, call the service, serialise the
- * result. Adding LinkedIn requires zero changes to this file, which is the
- * property the brief asks for.
+ * No automation logic and — critically — no provider names. It reads input, names
+ * the action, calls the service, returns the result. Adding LinkedIn requires zero
+ * changes to this file.
  *
- * Errors are never caught here; they propagate to the centralized handler.
+ * Errors are not caught here; Zod and AppError both propagate to the error handler.
  */
 
 /** POST /api/profile/update */
 export async function updateProfile(req: Request, res: Response): Promise<void> {
-  const { provider, trigger, dryRun } = validatedBody(req, updateProfileBodySchema);
+  const { provider, trigger, dryRun } = updateProfileSchema.parse(req.body);
 
-  const result = await automationService.execute({
+  const result = await executeAutomation({
     provider,
-    // The only provider-agnostic knowledge this route contributes.
+    // The only action-specific knowledge this route contributes.
     action: 'profile.update',
     trigger,
     dryRun,
   });
 
-  // 200 even for a reported failure: the *request* succeeded and the envelope
-  // carries the automation's own status. Genuine breakage throws and is mapped to
-  // 5xx by the error handler, so callers can still distinguish the two.
-  sendSuccess(res, result);
+  // 200 even when the automation reports failure: the *request* succeeded, and
+  // `status` carries the automation's own outcome. Real breakage throws and is
+  // mapped to 5xx, so callers can still tell the two apart.
+  res.json(result);
 }
 
-/**
- * GET /api/providers
- *
- * Capability discovery. Lets the dashboard and mobile app render available
- * automations from the registry instead of shipping a duplicated hardcoded list.
- */
+/** GET /api/providers — so a dashboard never hardcodes a provider list. */
 export function listProviders(_req: Request, res: Response): void {
-  sendSuccess(res, { providers: describeProviders() });
+  res.json({ providers: describeProviders() });
 }

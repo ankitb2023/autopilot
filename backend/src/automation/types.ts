@@ -3,46 +3,37 @@ import type { Logger } from '../config/logger';
 /**
  * The automation domain contract.
  *
- * This file is the seam that keeps AutoPilot from becoming "a Naukri app". Every
- * layer above it (controller, service) and below it (workers) speaks only in
- * these terms. Nothing outside `workers/` may mention a specific provider.
+ * This is the seam that keeps AutoPilot from becoming "a Naukri app". Everything
+ * above it (controller, service) and below it (workers) speaks only in these
+ * terms. Nothing outside `workers/` may name a specific provider.
  */
 
 /**
- * The full vocabulary of providers AutoPilot knows about — including ones not
- * yet implemented. Kept separate from the registry on purpose: this is the
- * *domain*, the registry is *reality*. An ID listed here but absent from the
- * registry yields a clean 400 naming what is actually available.
+ * Every provider AutoPilot knows about, including unimplemented ones. Kept
+ * separate from the registry on purpose: this is the domain, the registry is
+ * reality. An ID here but absent from the registry yields a clean 400.
  */
 export const PROVIDER_IDS = ['naukri', 'linkedin', 'github', 'indeed', 'resume_upload'] as const;
-
 export type ProviderId = (typeof PROVIDER_IDS)[number];
 
 /**
- * What a worker is being asked to do.
- *
- * Actions are namespaced (`domain.verb`) so one worker can serve several
- * behaviours without a class explosion — Phase 3's Naukri worker will handle
- * both `profile.update` and, later, `resume.upload`.
+ * What a worker is being asked to do. Namespaced (`domain.verb`) so one worker can
+ * serve several behaviours without a class explosion.
  */
 export const AUTOMATION_ACTIONS = ['profile.update'] as const;
-
 export type AutomationAction = (typeof AUTOMATION_ACTIONS)[number];
 
-/** Who asked for this run. Drives history filtering and alerting policy. */
+/** Who asked for this run. Cron runs are worth distinguishing in history. */
 export const TRIGGER_SOURCES = ['API', 'CRON', 'MANUAL'] as const;
-
 export type TriggerSource = (typeof TRIGGER_SOURCES)[number];
 
 /**
- * Everything a worker is handed for one run.
+ * Everything a worker gets for one run.
  *
- * Workers receive their logger rather than importing one, so the service can
- * pre-stamp provider/action/executionId — and so Phase 9 can swap in a logger
- * that also streams to a WebSocket without touching a single worker.
+ * The logger is passed in rather than imported so the service can pre-stamp it
+ * with executionId and provider — that is the whole correlation story.
  *
- * `signal` is honoured by workers for cooperative cancellation; the service
- * aborts it when the execution time budget expires so a hung Playwright session
+ * `signal` is aborted when the time budget expires, so a hung Playwright session
  * (Phase 3) releases its browser instead of leaking it.
  */
 export interface ExecutionContext {
@@ -59,23 +50,19 @@ export interface ExecutionContext {
 /**
  * What a worker reports back.
  *
- * A worker returns `success: false` for an expected, meaningful failure it can
- * describe (e.g. "profile headline unchanged, nothing to submit"). It *throws*
- * for genuine breakage — a failed login, a missing selector. The service
- * classifies both; workers never build HTTP responses.
+ * Return `success: false` for an expected, describable failure ("headline already
+ * current, nothing to submit"). **Throw** for genuine breakage — failed login,
+ * missing selector. The service classifies both; workers never build responses.
  */
 export interface WorkerOutcome {
   readonly success: boolean;
   readonly message: string;
-  /** Provider-specific structured payload, persisted as JSON in Phase 4. */
   readonly details?: Record<string, unknown>;
 }
 
 export interface AutomationWorker {
   readonly provider: ProviderId;
-  /** Actions this worker can service. Checked before it is invoked. */
   readonly supportedActions: readonly AutomationAction[];
-
   execute(context: ExecutionContext): Promise<WorkerOutcome>;
 }
 
@@ -93,14 +80,13 @@ export interface ExecutionRequest {
   readonly dryRun: boolean;
 }
 
-/** The service's result, and the shape the controller returns to clients. */
+/** The service's result, returned to clients as-is. */
 export interface ExecutionResult {
   readonly executionId: string;
   readonly provider: ProviderId;
   readonly action: AutomationAction;
   readonly trigger: TriggerSource;
   readonly status: 'SUCCESS' | 'FAILED';
-  readonly success: boolean;
   readonly message: string;
   readonly durationMs: number;
   readonly startedAt: string;

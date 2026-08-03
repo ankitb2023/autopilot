@@ -1,307 +1,220 @@
 # AutoPilot — Backend
 
-A personal automation platform. AutoPilot exposes a provider-agnostic HTTP API that
-runs automations on demand or on a schedule, records what happened, and notifies you.
+A personal automation platform. One API that runs automations on demand or on a
+schedule, records what happened, and (later) emails you about it.
 
-Naukri profile update is the first automation. It is **not** the architecture —
-Naukri is one worker plugged into an engine that treats LinkedIn, GitHub, Indeed and
-resume upload as equals.
-
----
+Naukri profile update is the first automation. It is **not** the architecture — Naukri
+is one worker plugged into an engine that treats LinkedIn, GitHub and Indeed as equals.
 
 ## Architecture
 
 ```
-HTTP request
-    │
-    ▼
-Route ─────────────► Zod validation (provider enum derived from the registry)
-    │
-    ▼
-Controller ────────► no provider names, no automation logic
-    │
-    ▼
-AutomationService ─► execution id · time budget · timing · logging · error mapping
-    │                (Phase 4: history persistence · Phase 5: notifications)
-    ▼
-Provider Registry ─► ProviderId → lazy worker factory
-    │
-    ▼
-AutomationWorker ──► NaukriWorker | LinkedInWorker | GitHubWorker | …
-    │                (Phase 3: Playwright lives here and nowhere else)
-    ▼
-Playwright / DB / Notifications
+POST /api/profile/update
+  → Controller           thin adapter; parses input, names the action
+  → executeAutomation()  execution id · lock · time budget · timing · logging · errors
+  → Execution Lock       TTL lease row; 409 if this provider is already running
+  → Provider Registry    ProviderId → lazy worker factory
+  → Worker               NaukriWorker | LinkedInWorker | …   (Playwright lives here)
 ```
 
-### The load-bearing decisions
+### The decisions that matter
 
 **Provider registry, not a `switch`.** [`provider.registry.ts`](src/automation/provider.registry.ts)
-maps provider IDs to lazy worker factories. The set of supported providers is _data_,
-so request validation reads from the same source as the factory and the two cannot
-drift. Adding LinkedIn is one new file plus one line in the registry — no controller,
-route, service or schema change.
+maps provider IDs to lazy worker factories. The supported set is _data_, and the Zod
+schema derives its enum from it — so validation and the factory cannot drift apart.
+Adding LinkedIn is one new file plus one line in the registry.
 
-**Domain vocabulary vs. reality.** `PROVIDER_IDS` in [`types.ts`](src/automation/types.ts)
-lists every provider AutoPilot knows about; the registry holds only the ones that are
-implemented. An unimplemented provider is rejected at the edge with a message naming
-what _is_ available.
+**Domain vocabulary vs. reality.** `PROVIDER_IDS` lists every provider AutoPilot knows
+about; the registry holds only the implemented ones. Unimplemented → 400 naming what
+_is_ available.
 
-**Lazy worker construction.** Workers are created per execution via `() => new Worker()`.
-Phase 3 workers own browser contexts; constructing all of them at boot would launch
-Chromium instances we never use.
+**Lazy worker construction.** Workers are built per run via `() => new Worker()`. Phase 3
+workers own browser contexts; building all of them at boot would launch browsers we
+never use.
 
 **Workers are dumb on purpose.** A worker gets an `ExecutionContext` (id, action, dryRun,
-logger, AbortSignal) and returns a `WorkerOutcome`. It never touches HTTP, the database,
-or notifications. That is what makes them genuinely swappable rather than swappable in
-theory.
+logger, AbortSignal) and returns a `WorkerOutcome`. It never touches HTTP or the
+database. Return `success: false` for an expected failure; **throw** for real breakage.
 
-**One envelope, one error path.** Every response is `{ success, data | error, meta }`,
-discriminated on `success`. Every error — validation, provider, unhandled — is shaped by
-[`errorHandler.ts`](src/middleware/errorHandler.ts). Stack traces are logged, never sent.
+**Single-flight per provider.** A cron tick arriving while the previous run is still
+going would start a second automation — from Phase 3, two browsers logging into the same
+account, a plausible way to get flagged. [`execution.lock.ts`](src/automation/execution.lock.ts)
+gates every run on a TTL lease row taken with one atomic upsert. Details, including why
+this is not a Postgres advisory lock, are in that file's header comment.
 
-**Correlation via `AsyncLocalStorage`.** `requestId` and `executionId` are attached to
-every log line without threading a logger through call signatures. Phase 9 streams live
-logs to the dashboard by keying on `executionId` — this is the groundwork.
-
-**Liveness ≠ readiness.** `/health` never touches the database, so a slow Neon query
-cannot get a healthy container killed mid-automation. `/health/ready` probes Postgres and
-returns 503 when it is unreachable.
-
-### Project layout
-
-```
-backend/
-├── prisma/
-│   ├── schema.prisma              # ExecutionHistory · Setting · User · Notification
-│   └── migrations/                # baseline migration, committed
-├── src/
-│   ├── automation/                # the engine — no HTTP knowledge
-│   │   ├── types.ts               # ProviderId · AutomationWorker · contexts
-│   │   ├── provider.registry.ts   # the factory
-│   │   ├── automation.service.ts  # orchestration & cross-cutting concerns
-│   │   └── workers/
-│   │       └── naukri.worker.ts   # Phase 1 stub; Phase 3 fills in Playwright
-│   ├── config/                    # env (Zod-validated) · logger · prisma
-│   ├── controllers/               # thin HTTP adapters
-│   ├── core/                      # errors · response envelope · async context
-│   ├── middleware/                # context · logging · validate · rate limit · errors
-│   ├── routes/
-│   ├── utils/
-│   ├── validation/                # Zod request schemas
-│   ├── app.ts                     # Express assembly (no port binding)
-│   └── server.ts                  # lifecycle: listen + graceful shutdown
-├── Dockerfile                     # 4-stage build, non-root runtime
-└── docker-compose.yml             # Postgres + API for local development
-```
-
----
+**Correlation without machinery.** The service builds a child logger stamped with
+`executionId` + provider and passes it down through the context. Every line of a run is
+attributable; no async-context plumbing.
 
 ## Getting started
 
-**Requirements:** Node **22+** (`nvm use`), and either Docker or a reachable Postgres.
+Needs Node 22 (`nvm use`) and a Postgres URL (Neon's free tier is fine).
 
 ```bash
 cd backend
-cp .env.example .env
+cp .env.example .env      # then set DATABASE_URL
 npm install
 npx prisma generate
-npm run dev            # http://localhost:8080
+npm run prisma:migrate    # creates the tables
+npm run dev               # http://localhost:8080
 ```
-
-### With Docker (no local Postgres needed)
-
-```bash
-docker compose up --build
-```
-
-Brings up Postgres, waits for it to be genuinely healthy, applies migrations, and starts
-the API on `:8080`.
-
-### Applying migrations against your own database
-
-```bash
-npm run prisma:migrate     # development: creates + applies
-npm run prisma:deploy      # production/CI: applies committed migrations only
-```
-
----
 
 ## API
 
-All responses share one envelope:
-
-```jsonc
-// success
-{ "success": true, "data": { … }, "meta": { "requestId": "…", "timestamp": "…" } }
-
-// error
-{ "success": false, "error": { "code": "…", "message": "…", "details": … },
-  "meta": { "requestId": "…", "timestamp": "…" } }
-```
-
-Send `X-Request-Id` to have your own trace ID adopted end to end; otherwise one is
-minted and returned in both the header and `meta.requestId`.
+Plain JSON, no envelope. Errors are always `{ code, message, details? }`.
 
 ### `POST /api/profile/update`
-
-Runs the `profile.update` action against a provider.
 
 ```jsonc
 {
   "provider": "naukri", // required — must be a registered provider
-  "trigger": "API", // optional — API | CRON | MANUAL (default API)
+  "trigger": "API", // optional — API | CRON | MANUAL
   "dryRun": false // optional — run the pipeline, mutate nothing
 }
 ```
 
 ```bash
 curl -X POST http://localhost:8080/api/profile/update \
-  -H 'content-type: application/json' \
-  -d '{"provider":"naukri"}'
+  -H 'content-type: application/json' -d '{"provider":"naukri"}'
 ```
 
 ```jsonc
 {
-  "success": true,
-  "data": {
-    "executionId": "31105557-281b-481d-809c-63813061f139",
-    "provider": "naukri",
-    "action": "profile.update",
-    "trigger": "API",
-    "status": "SUCCESS",
-    "success": true,
-    "message": "Naukri worker executed.",
-    "durationMs": 1,
-    "startedAt": "2026-08-03T09:22:46.205Z",
-    "finishedAt": "2026-08-03T09:22:46.206Z",
-    "details": { "stub": true, "dryRun": false }
-  },
-  "meta": { "requestId": "…", "timestamp": "…" }
+  "executionId": "bc41f1d3-d60a-4f89-8211-470b740e3817",
+  "provider": "naukri",
+  "action": "profile.update",
+  "trigger": "CRON",
+  "status": "SUCCESS",
+  "message": "Naukri worker executed.",
+  "durationMs": 2002,
+  "startedAt": "2026-08-03T11:20:44.537Z",
+  "finishedAt": "2026-08-03T11:20:46.541Z",
+  "details": { "stub": true, "dryRun": false }
 }
 ```
 
-The same endpoint serves `{"provider":"linkedin"}` the moment a LinkedIn worker is
-registered. No change to this route, its controller, or its schema.
+The same endpoint serves `{"provider":"linkedin"}` once that worker is registered — no
+change to the route, controller or schema.
 
-**Status codes:** `200` request handled (check `data.status` for the automation's own
-outcome) · `400` validation / unsupported provider · `429` rate limited · `502`
-automation failed · `504` execution timed out · `500` unexpected.
+**Status codes:** `200` handled (check `status` for the automation's own outcome) ·
+`400` validation / unknown provider · `409` a run for this provider is already going ·
+`502` automation failed · `503` couldn't verify exclusivity, refused · `504` timed out ·
+`500` unexpected.
+
+A **409 is normal** for an overlapping cron tick, not an error — there is nothing to
+retry, the work is already being done. It carries a `Retry-After` header.
+
+```jsonc
+{
+  "code": "EXECUTION_IN_PROGRESS",
+  "message": "An automation for \"naukri\" is already running.",
+  "details": { "lockKey": "naukri", "heldByExecutionId": "bc41f1d3-…" }
+}
+```
 
 ### `GET /api/providers`
 
-Capability discovery, read from the registry — so the dashboard and mobile app never
-ship a duplicated hardcoded list.
-
 ```jsonc
-{ "success": true,
-  "data": { "providers": [ { "provider": "naukri", "supportedActions": ["profile.update"] } ] },
-  "meta": { … } }
+{ "providers": [{ "provider": "naukri", "supportedActions": ["profile.update"] }] }
 ```
 
-### `GET /health` · `GET /health/ready`
+### `GET /health`
 
-Liveness (cheap, no dependencies — point Render's health check here) and readiness
-(probes Postgres, `503` when down).
-
----
+`{ "status": "ok", "uptimeSeconds": 42 }` — touches nothing, so a slow database can't get
+the container restarted mid-automation. Point Render's health check here.
 
 ## Adding a provider
 
 1. `src/automation/workers/linkedin.worker.ts` implementing `AutomationWorker`.
 2. Add `linkedin: () => new LinkedInWorker(),` to the registry.
 
-That is the whole change. Validation, the controller, the service and the API contract
-all pick it up automatically.
+That's the whole change. If adding a provider ever requires editing the controller,
+route or schema, the architecture has been violated — fix that instead.
 
 ```ts
 export class LinkedInWorker implements AutomationWorker {
   readonly provider: ProviderId = 'linkedin';
   readonly supportedActions: readonly AutomationAction[] = ['profile.update'];
 
-  async execute(context: ExecutionContext): Promise<WorkerOutcome> {
-    context.signal.throwIfAborted();
+  async execute({ logger, signal }: ExecutionContext): Promise<WorkerOutcome> {
+    signal.throwIfAborted();
     return { success: true, message: 'LinkedIn worker executed.' };
   }
 }
 ```
 
-Convention: return `success: false` for an expected, describable non-success; **throw**
-for genuine breakage. The service classifies both — workers never build HTTP responses.
+## Layout
 
----
+```
+src/
+├── server.ts                     # express app, routes, listen, graceful shutdown
+├── automation/
+│   ├── types.ts                  # the domain contract
+│   ├── provider.registry.ts      # the factory
+│   ├── execution.lock.ts         # single-flight gate
+│   ├── automation.service.ts     # orchestration + cross-cutting concerns
+│   └── workers/naukri.worker.ts
+├── config/                       # env (Zod, fail-fast) · logger · prisma
+├── controllers/automation.controller.ts
+├── core/errors.ts
+├── middleware/errorHandler.ts
+├── utils/asyncHandler.ts
+└── validation/automation.schema.ts
+```
 
 ## Configuration
 
-Validated by Zod at boot; an invalid environment exits immediately with a readable report
-rather than failing mid-run at 3am. See [.env.example](.env.example).
+Validated by Zod at boot — an invalid environment exits immediately rather than failing
+mid-run. See [.env.example](.env.example).
 
-| Variable                    | Default            | Purpose                                              |
-| --------------------------- | ------------------ | ---------------------------------------------------- |
-| `NODE_ENV`                  | `development`      | `development` \| `test` \| `production`              |
-| `PORT` / `HOST`             | `8080` / `0.0.0.0` | HTTP bind                                            |
-| `DATABASE_URL`              | —                  | **Required.** Postgres connection string             |
-| `LOG_LEVEL`                 | `info`             | `error` … `debug`                                    |
-| `CORS_ORIGINS`              | `*`                | Comma-separated allowlist, or `*`                    |
-| `EXECUTION_TIMEOUT_MS`      | `120000`           | Hard ceiling per automation run                      |
-| `AUTOMATION_API_KEY`        | —                  | Shared secret for cron callers (consumed in Phase 2) |
-| `RATE_LIMIT_WINDOW_SECONDS` | `60`               | API rate-limit window                                |
-| `RATE_LIMIT_MAX_REQUESTS`   | `60`               | Requests per window                                  |
+| Variable               | Default       | Purpose                                    |
+| ---------------------- | ------------- | ------------------------------------------ |
+| `DATABASE_URL`         | —             | **Required.** Postgres connection string   |
+| `NODE_ENV`             | `development` | `development` \| `production`              |
+| `PORT`                 | `8080`        | HTTP port                                  |
+| `LOG_LEVEL`            | `info`        | `error` … `debug`                          |
+| `EXECUTION_TIMEOUT_MS` | `120000`      | Ceiling per run; also drives the lock TTL  |
+| `AUTOMATION_API_KEY`   | —             | Cron shared secret (defined, not yet used) |
 
-Secrets live in the environment only — never in the `Setting` table, never in git.
-
----
+Secrets live in the environment only, never in the database, never in git.
 
 ## Scripts
 
-| Command                     | Purpose                          |
-| --------------------------- | -------------------------------- |
-| `npm run dev`               | Watch mode via tsx               |
-| `npm run build`             | Compile to `dist/`               |
-| `npm start`                 | Run the compiled server          |
-| `npm run typecheck`         | `tsc --noEmit`                   |
-| `npm run lint` / `lint:fix` | Type-aware ESLint                |
-| `npm run format`            | Prettier                         |
-| `npm run prisma:generate`   | Regenerate the Prisma client     |
-| `npm run prisma:migrate`    | Create + apply a migration (dev) |
-| `npm run prisma:deploy`     | Apply migrations (prod/CI)       |
-| `npm run prisma:studio`     | Browse the database              |
-
----
+`dev` · `build` · `start` · `typecheck` · `lint` · `format` · `prisma:generate` ·
+`prisma:migrate` · `prisma:deploy` · `prisma:studio`
 
 ## Operational notes
 
-- **Graceful shutdown.** SIGTERM stops accepting connections, drains in-flight work,
-  closes the Prisma pool, and hard-exits after 15s if draining stalls. Render sends
-  SIGTERM on every deploy; from Phase 3 a running automation owns a browser process, so
-  this path is what prevents leaked Chromium and stuck `RUNNING` history rows.
-- **Rate limiting is per-instance** (in-memory store). Correct for a single Render
-  instance; switch to a Redis store before scaling horizontally.
-- **Logs go to stdout only.** Containers are ephemeral and the platform owns log
-  shipping. Execution _history_ is a database concern, not a logfile concern.
-- **`prisma` is a runtime dependency**, not a dev dependency, so `prisma migrate deploy`
-  can run as a release step inside the production image.
-- **Docker base image changes in Phase 3.** Playwright needs system browser libraries;
-  the runtime stage moves to `mcr.microsoft.com/playwright:*`. Hand-installing libs onto
-  `node:22-slim` invites version skew between the npm package and the system browser.
+- **Graceful shutdown.** SIGTERM stops accepting, drains, closes the Prisma pool, and
+  force-exits after 15s. Render sends SIGTERM on every deploy; from Phase 3 a run owns a
+  browser process, so this prevents leaked Chromium.
+- **A stuck lock self-heals** in `EXECUTION_TIMEOUT_MS + 30s` (~2.5 min). No admin
+  force-release endpoint on purpose — the TTL makes one unnecessary, and an endpoint that
+  can break mutual exclusion is a foot-gun. Inspect: `SELECT * FROM automation_locks;`
+- **`prisma` is a runtime dependency**, not a dev one, so `prisma migrate deploy` can run
+  as a Render pre-deploy command.
+- **Phase 3 needs a Playwright-capable environment.** Render's standard Node runtime lacks
+  the system browser libraries; plan on Render's Docker option or a Playwright base image
+  at that point.
 
-## Known limitations (Phase 1, by design)
+## Known limitations (deliberate)
 
-- The Naukri worker is a stub — no Playwright, no credentials, no selectors.
-- Nothing is written to `execution_history` yet. The service has two marked seams for it.
-- No authentication. `AUTOMATION_API_KEY` is defined but not yet enforced.
-- No automated tests. `app.ts` is already decoupled from port binding so Supertest can
-  mount it directly.
+- The Naukri worker is a stub — no Playwright, credentials or selectors.
+- Nothing is written to `execution_history` yet; the service has marked seams for it.
+- No authentication. `AUTOMATION_API_KEY` exists in config but nothing enforces it.
+- No test suite yet.
+- The execution lock has no heartbeat, and needs none while the service enforces
+  `EXECUTION_TIMEOUT_MS` — a lease always outlives the run it guards. If Phase 3 ever
+  needs longer runs, add lease renewal at the same time.
 
 ## Roadmap
 
-| Phase | Scope                                                                  | Status  |
-| ----- | ---------------------------------------------------------------------- | ------- |
-| 1     | Engine skeleton, provider factory, validation, logging, errors, Docker | ✅ Done |
-| 2     | Render deployment, GitHub Actions cron trigger, API-key auth           | Next    |
-| 3     | Playwright: login, profile update, screenshot on failure               |         |
-| 4     | Persist execution history                                              |         |
-| 5     | Email notifications (Nodemailer)                                       |         |
-| 6     | Next.js dashboard                                                      |         |
-| 7     | React Native app                                                       |         |
-| 8     | Push notifications                                                     |         |
-| 9     | Live execution logs over WebSocket                                     |         |
+| Phase | Scope                                                        | Status  |
+| ----- | ------------------------------------------------------------ | ------- |
+| 1     | Engine, provider registry, execution lock, validation, logs  | ✅ Done |
+| 2     | Render deployment, GitHub Actions cron, API-key auth         | Next    |
+| 3     | Playwright: Naukri login, profile update, failure screenshot |         |
+| 4     | Persist execution history                                    |         |
+| 5     | Email notifications                                          |         |
+| 6     | Dashboard                                                    |         |
+| 7+    | Mobile app · push notifications · live logs                  |         |

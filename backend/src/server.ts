@@ -1,114 +1,109 @@
-import type { Server } from 'node:http';
+import express from 'express';
 
-import { createApp } from './app';
+import { listProviders, updateProfile } from './controllers/automation.controller';
+import { getSupportedProviders } from './automation/provider.registry';
 import { env } from './config/env';
 import { logger } from './config/logger';
-import { disconnectPrisma } from './config/prisma';
-import { getSupportedProviders } from './automation/provider.registry';
+import { prisma } from './config/prisma';
+import { errorHandler, notFoundHandler } from './middleware/errorHandler';
+import { asyncHandler } from './utils/asyncHandler';
+
+const app = express();
+
+// Render terminates TLS upstream, so req.ip must come from X-Forwarded-For.
+// `1` trusts exactly one hop; `true` would let clients spoof their IP.
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+app.use(express.json({ limit: '64kb' }));
+
+// Access log. Emitted on finish so status and duration are known.
+app.use((req, res, next) => {
+  const start = performance.now();
+  res.on('finish', () => {
+    const meta = {
+      method: req.method,
+      path: req.originalUrl,
+      status: res.statusCode,
+      durationMs: Math.round(performance.now() - start),
+    };
+    // Health checks are polled constantly; keep them out of the way.
+    if (req.path === '/health') logger.debug('request', meta);
+    else if (res.statusCode >= 500) logger.error('request', meta);
+    else logger.info('request', meta);
+  });
+  next();
+});
 
 /**
- * Process entry point.
- *
- * Responsible only for lifecycle: bind the port, then shut down cleanly. All
- * HTTP concerns live in `app.ts`.
- *
- * Graceful shutdown is not optional here. Render sends SIGTERM on every deploy,
- * and from Phase 3 onward a running automation owns a browser process — killing
- * it mid-flight leaks Chromium and (from Phase 4) leaves an execution row stuck
- * in RUNNING forever. We stop accepting connections, let in-flight work drain,
- * close the database pool, and hard-exit if draining stalls.
+ * Liveness. Deliberately touches nothing — Render's health check points here, and
+ * if this queried Postgres a few seconds of Neon latency would get the container
+ * restarted, dropping any in-flight automation.
  */
-const SHUTDOWN_TIMEOUT_MS = 15_000;
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', uptimeSeconds: Math.round(process.uptime()) });
+});
 
+/**
+ * POST /api/profile/update — provider-agnostic by contract.
+ * `{"provider":"naukri"}` today, `{"provider":"linkedin"}` once that worker is
+ * registered: same route, same controller, same validation.
+ */
+app.post('/api/profile/update', asyncHandler(updateProfile));
+app.get('/api/providers', listProviders);
+
+app.use(notFoundHandler);
+app.use(errorHandler);
+
+const server = app.listen(env.PORT, () => {
+  logger.info('autopilot started', {
+    port: env.PORT,
+    environment: env.NODE_ENV,
+    providers: getSupportedProviders(),
+  });
+});
+
+// Slightly above typical proxy idle timeouts, to avoid 502s when the proxy reuses
+// a connection we are closing at the same moment.
+server.keepAliveTimeout = 65_000;
+server.headersTimeout = 66_000;
+
+/**
+ * Graceful shutdown. Render sends SIGTERM on every deploy, and from Phase 3 a
+ * running automation owns a browser process — killing it mid-flight leaks Chromium
+ * and (from Phase 4) leaves a history row stuck in RUNNING.
+ */
 let shuttingDown = false;
 
-function startServer(): Server {
-  const app = createApp();
+function shutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info('shutting down', { signal });
 
-  const server = app.listen(env.PORT, env.HOST, () => {
-    logger.info('autopilot backend started', {
-      host: env.HOST,
-      port: env.PORT,
-      environment: env.NODE_ENV,
-      providers: getSupportedProviders(),
-      nodeVersion: process.version,
+  const force = setTimeout(() => {
+    logger.error('shutdown timed out; forcing exit');
+    process.exit(1);
+  }, 15_000);
+  force.unref();
+
+  server.close(() => {
+    void prisma.$disconnect().finally(() => {
+      clearTimeout(force);
+      process.exit(0);
     });
   });
-
-  // Slightly above typical proxy idle timeouts, to avoid 502s from races where
-  // the proxy reuses a connection we are simultaneously closing.
-  server.keepAliveTimeout = 65_000;
-  server.headersTimeout = 66_000;
-
-  server.on('error', (error) => {
-    logger.error('http server error', { error });
-    process.exit(1);
-  });
-
-  return server;
 }
 
-/**
- * Releases external resources once the HTTP server has stopped accepting and
- * drained connections, then exits with a status the platform can act on.
- */
-async function finalizeShutdown(forceExitTimer: NodeJS.Timeout, closeError?: Error): Promise<void> {
-  if (closeError) {
-    logger.error('error while closing http server', { error: closeError });
-  }
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
-  try {
-    await disconnectPrisma();
-    logger.info('shutdown complete');
-    clearTimeout(forceExitTimer);
-    process.exit(0);
-  } catch (error) {
-    logger.error('error during shutdown', { error });
-    process.exit(1);
-  }
-}
-
-function registerShutdownHandlers(server: Server): void {
-  const shutdown = (signal: string): void => {
-    if (shuttingDown) {
-      logger.warn('shutdown already in progress', { signal });
-      return;
-    }
-    shuttingDown = true;
-
-    logger.info('shutdown initiated', { signal, timeoutMs: SHUTDOWN_TIMEOUT_MS });
-
-    const forceExit = setTimeout(() => {
-      logger.error('graceful shutdown timed out; forcing exit');
-      process.exit(1);
-    }, SHUTDOWN_TIMEOUT_MS);
-    forceExit.unref();
-
-    // `server.close` expects a void-returning callback, so the async cleanup is
-    // an explicitly-voided call rather than an async callback.
-    server.close((closeError) => {
-      void finalizeShutdown(forceExit, closeError);
-    });
-  };
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-
-  /**
-   * An uncaught exception means the process is in an unknown state. We log and
-   * exit rather than pretending to recover — the platform restarts us, and a
-   * clean restart is strictly safer than serving from corrupted state.
-   */
-  process.on('uncaughtException', (error) => {
-    logger.error('uncaught exception; exiting', { error, stack: error.stack });
-    shutdown('uncaughtException');
-  });
-
-  process.on('unhandledRejection', (reason) => {
-    logger.error('unhandled promise rejection; exiting', { reason });
-    shutdown('unhandledRejection');
-  });
-}
-
-const server = startServer();
-registerShutdownHandlers(server);
+// An uncaught error leaves the process in an unknown state. Exit and let the
+// platform restart us — cleaner than serving from corrupted state.
+process.on('uncaughtException', (error) => {
+  logger.error('uncaught exception', { error: error.message, stack: error.stack });
+  shutdown('uncaughtException');
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error('unhandled rejection', { reason: String(reason) });
+  shutdown('unhandledRejection');
+});

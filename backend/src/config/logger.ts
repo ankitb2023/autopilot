@@ -1,74 +1,35 @@
 import winston from 'winston';
 
-import { getContext } from '../core/context';
 import { env, isProduction } from './env';
 
 /**
- * Logging strategy.
+ * Logging: JSON to stdout in production (Render ingests it directly),
+ * human-readable in development. No log files — the platform owns log shipping,
+ * and execution history is a database concern.
  *
- * - Production: single-line JSON on stdout. Render, Loki, Datadog and friends
- *   all ingest that without an agent, and Phase 6's dashboard can parse it.
- * - Development: colourised human-readable output.
- *
- * We deliberately do NOT write log files. Containers are ephemeral; the platform
- * owns log shipping. Execution *history* is a database concern (Phase 4), not a
- * logfile concern.
+ * Correlation is handled by passing a child logger down through the execution
+ * context, which stamps every line with executionId + provider. No async-context
+ * machinery needed.
  */
-
-/** Injects the ambient requestId / executionId into every record. */
-const correlationFormat = winston.format((info) => {
-  const context = getContext();
-  if (context) {
-    info.requestId = context.requestId;
-    if (context.executionId) info.executionId = context.executionId;
-  }
-  return info;
-});
-
-const developmentFormat = winston.format.combine(
-  winston.format.colorize({ level: true }),
-  winston.format.timestamp({ format: 'HH:mm:ss.SSS' }),
-  winston.format.printf((info) => {
-    const { timestamp, level, message, stack, requestId, executionId, ...rest } = info;
-
-    const tags = [requestId, executionId].filter(Boolean).join(' ');
-    const meta = Object.keys(rest).length > 0 ? ` ${JSON.stringify(rest)}` : '';
-    const suffix = typeof stack === 'string' ? `\n${stack}` : '';
-
-    return `${String(timestamp)} ${level}${tags ? ` [${tags}]` : ''} ${String(message)}${meta}${suffix}`;
-  }),
-);
-
-const productionFormat = winston.format.combine(
-  winston.format.timestamp(),
-  winston.format.errors({ stack: true }),
-  winston.format.json(),
-);
-
 export const logger = winston.createLogger({
   level: env.LOG_LEVEL,
-  defaultMeta: { service: 'autopilot-backend' },
-  format: winston.format.combine(
-    correlationFormat(),
-    winston.format.errors({ stack: true }),
-    isProduction ? productionFormat : developmentFormat,
-  ),
-  transports: [
-    new winston.transports.Console({
-      // Never let a logging failure take down an automation run.
-      handleExceptions: false,
-      handleRejections: false,
-    }),
-  ],
-  exitOnError: false,
+  format: isProduction
+    ? winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.errors({ stack: true }),
+        winston.format.json(),
+      )
+    : winston.format.combine(
+        winston.format.colorize({ level: true }),
+        winston.format.timestamp({ format: 'HH:mm:ss' }),
+        winston.format.printf(({ timestamp, level, message, stack, ...meta }) => {
+          const extra = Object.keys(meta).length > 0 ? ` ${JSON.stringify(meta)}` : '';
+          return `${String(timestamp)} ${level} ${String(message)}${extra}${
+            typeof stack === 'string' ? `\n${stack}` : ''
+          }`;
+        }),
+      ),
+  transports: [new winston.transports.Console()],
 });
 
 export type Logger = winston.Logger;
-
-/**
- * Creates a child logger with permanent metadata — used to stamp every line
- * emitted by a worker with its provider and action.
- */
-export function createChildLogger(meta: Record<string, unknown>): Logger {
-  return logger.child(meta);
-}

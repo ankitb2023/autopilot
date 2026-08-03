@@ -92,6 +92,23 @@ export class NaukriWorker implements AutomationWorker {
       await page.goto('https://www.naukri.com/', { waitUntil: 'domcontentloaded' });
       await page.waitForTimeout(2000);
       
+      if (cookies.length === 0 && env.NAUKRI_EMAIL && env.NAUKRI_PASSWORD) {
+        logger.info('no cookies provided, attempting standard email/password login');
+        await page.goto('https://www.naukri.com/nlogin/login', { waitUntil: 'domcontentloaded' });
+        
+        // Wait for login fields and fill them slowly to mimic human typing
+        await page.locator('#usernameField').waitFor({ state: 'visible', timeout: 10000 });
+        await page.locator('#usernameField').type(env.NAUKRI_EMAIL, { delay: 100 });
+        
+        await page.locator('#passwordField').type(env.NAUKRI_PASSWORD, { delay: 100 });
+        
+        logger.info('credentials entered, clicking login button');
+        await page.locator('button[type="submit"]').first().click();
+        
+        // Wait for navigation after login
+        await page.waitForTimeout(5000);
+      }
+      
       logger.info('navigating to naukri profile page');
       await page.goto('https://www.naukri.com/mnjuser/profile', { waitUntil: 'domcontentloaded' });
       signal.throwIfAborted();
@@ -99,9 +116,28 @@ export class NaukriWorker implements AutomationWorker {
       // Give React some time to render the initial DOM just in case
       await page.waitForTimeout(3000);
       
-      // Check if we were redirected to login page due to expired cookies
+      // Check if we were redirected to login page due to expired cookies or failed login
       if (page.url().includes('login')) {
-        throw new Error('Redirected to login page. Your NAUKRI_COOKIES have expired or are invalid.');
+        let screenshotBase64 = '';
+        try {
+          // Wait an extra 2 seconds before screenshot so we can capture any CAPTCHAs that might be rendering
+          await page.waitForTimeout(2000);
+          const buffer = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: true });
+          screenshotBase64 = buffer.toString('base64');
+          logger.info('captured login failure screenshot');
+        } catch (screenshotError) {
+          logger.error('failed to capture login failure screenshot', { error: String(screenshotError) });
+        }
+
+        return {
+          success: false,
+          message: 'Login failed or redirected to login page. Check screenshot for CAPTCHA.',
+          details: { 
+            dryRun, 
+            url: page.url(),
+            screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : 'Failed to capture' 
+          },
+        };
       }
       
       if (dryRun) {

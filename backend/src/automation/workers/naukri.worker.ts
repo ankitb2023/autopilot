@@ -24,7 +24,12 @@ export class NaukriWorker implements AutomationWorker {
       logger.info('launching browser');
       browser = await chromium.launch({
         headless: env.NODE_ENV === 'production',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+        args: [
+          '--no-sandbox', 
+          '--disable-setuid-sandbox', 
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled'
+        ],
       });
       signal.throwIfAborted();
 

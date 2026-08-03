@@ -46,7 +46,18 @@ export class NaukriWorker implements AutomationWorker {
       });
       
       if (cookies.length > 0) {
-        await context.addCookies(cookies);
+        // Sanitize cookies because Chrome extensions sometimes export invalid Playwright formats
+        const sanitizedCookies = cookies.map((cookie: any) => {
+          if (cookie.sameSite && !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) {
+            if (cookie.sameSite.toLowerCase() === 'no_restriction') cookie.sameSite = 'None';
+            else if (cookie.sameSite.toLowerCase() === 'lax') cookie.sameSite = 'Lax';
+            else if (cookie.sameSite.toLowerCase() === 'strict') cookie.sameSite = 'Strict';
+            else delete cookie.sameSite;
+          }
+          return cookie;
+        });
+
+        await context.addCookies(sanitizedCookies);
         logger.info('injected session cookies into browser context');
       }
 

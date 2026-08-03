@@ -101,8 +101,26 @@ export class NaukriWorker implements AutomationWorker {
           await page.waitForTimeout(3000); 
         } catch (e: any) {
           logger.warn('could not execute the exact edit/save sequence. Taking screenshot and continuing.', { error: e.message });
-          // Ensure directory exists or use tmp/ (optional)
-          // await page.screenshot({ path: 'naukri-error.png' });
+          logger.warn(`Debug info - Current URL: ${page.url()}`);
+          
+          let screenshotBase64 = '';
+          try {
+            const buffer = await page.screenshot({ type: 'jpeg', quality: 50 });
+            screenshotBase64 = buffer.toString('base64');
+            logger.info('captured debug screenshot');
+          } catch (screenshotError) {
+            logger.error('failed to capture screenshot', { error: String(screenshotError) });
+          }
+
+          return {
+            success: false,
+            message: `Failed to find or click Key skills section: ${e.message}`,
+            details: { 
+              dryRun, 
+              url: page.url(),
+              screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : 'Failed to capture' 
+            },
+          };
         }
       }
 

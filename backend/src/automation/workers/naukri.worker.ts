@@ -6,14 +6,13 @@ import type {
   WorkerOutcome,
 } from '../types';
 import { env } from '../../config/env';
+import { prisma } from '../../config/prisma';
 
 /**
  * Naukri automation worker — Direct API approach.
  * 
- * Instead of launching a browser (which gets blocked by Akamai WAF on cloud servers),
- * this worker calls Naukri's internal REST APIs directly:
- * 1. Logs in via the login API to get a fresh JWT Bearer token
- * 2. Calls the profile update API to re-save Key Skills (triggers "profile updated today")
+ * Uses a stored JWT token (obtained via the /api/auth MFA flow) to call
+ * Naukri's profile update API directly. No browser needed.
  */
 export class NaukriWorker implements AutomationWorker {
   readonly provider: ProviderId = 'naukri';
@@ -24,28 +23,32 @@ export class NaukriWorker implements AutomationWorker {
     signal.throwIfAborted();
 
     try {
-      // ── Step 1: Authenticate ─────────────────────────────────────────
-      let bearerToken: string | null = null;
+      // ── Step 1: Get a valid token from the database ──────────────────
+      const storedToken = await prisma.naukriToken.findFirst({
+        where: { expiresAt: { gt: new Date() } },
+        orderBy: { expiresAt: 'desc' },
+      });
 
-      if (env.NAUKRI_EMAIL && env.NAUKRI_PASSWORD) {
-        logger.info('logging in via Naukri API to get fresh token');
-        bearerToken = await this.loginViaApi(env.NAUKRI_EMAIL, env.NAUKRI_PASSWORD, logger);
-      }
-
-      if (!bearerToken) {
+      if (!storedToken) {
         return {
           success: false,
-          message: 'Failed to obtain bearer token. Check NAUKRI_EMAIL and NAUKRI_PASSWORD.',
+          message: 'No valid Naukri token found. Please authenticate first via POST /api/auth/init-login → POST /api/auth/verify-otp.',
           details: {},
         };
       }
 
-      logger.info('successfully obtained bearer token');
+      const minutesRemaining = Math.round((storedToken.expiresAt.getTime() - Date.now()) / 60000);
+      logger.info('using stored token', { expiresAt: storedToken.expiresAt.toISOString(), minutesRemaining });
+
+      if (minutesRemaining < 5) {
+        logger.warn('token is about to expire, update may fail');
+      }
+
       signal.throwIfAborted();
 
       if (dryRun) {
         logger.info('dry run: skipping actual profile update');
-        return { success: true, message: 'Dry run completed — login successful.', details: { dryRun: true } };
+        return { success: true, message: 'Dry run completed — valid token found.', details: { dryRun: true, minutesRemaining } };
       }
 
       // ── Step 2: Update profile via API ───────────────────────────────
@@ -70,7 +73,7 @@ export class NaukriWorker implements AutomationWorker {
           headers: {
             'accept': 'application/json',
             'content-type': 'application/json',
-            'authorization': `Bearer ${bearerToken}`,
+            'authorization': `Bearer ${storedToken.accessToken}`,
             'appid': '105',
             'clientid': 'd3skt0p',
             'systemid': 'Naukri',
@@ -121,72 +124,6 @@ export class NaukriWorker implements AutomationWorker {
         message: 'Failed to update Naukri profile',
         details: { error: message },
       };
-    }
-  }
-
-  /**
-   * Login to Naukri via their internal API and extract the JWT access token.
-   */
-  private async loginViaApi(email: string, password: string, logger: ExecutionContext['logger']): Promise<string | null> {
-    try {
-      const loginResponse = await globalThis.fetch(
-        'https://www.naukri.com/central-login-services/v1/login',
-        {
-          method: 'POST',
-          headers: {
-            'accept': 'application/json',
-            'content-type': 'application/json',
-            'appid': '105',
-            'systemid': 'jobseeker',
-            'clientid': 'd3skt0p',
-            'x-requested-with': 'XMLHttpRequest',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-            'origin': 'https://www.naukri.com',
-            'referer': 'https://www.naukri.com/nlogin/login',
-          },
-          body: JSON.stringify({ username: email, password }),
-        }
-      );
-
-      logger.info('login API response status', { status: loginResponse.status });
-
-      if (!loginResponse.ok) {
-        const errorBody = await loginResponse.text();
-        logger.error('login API failed', { status: loginResponse.status, body: errorBody.substring(0, 500) });
-        return null;
-      }
-
-      // Try to get the token from the response body
-      const data = await loginResponse.json() as Record<string, unknown>;
-      logger.info('login response keys', { keys: Object.keys(data) });
-      
-      // Naukri login API typically returns the token in one of these fields
-      const token = (data.token || data.accessToken || data.access_token) as string | undefined;
-      
-      if (token) {
-        logger.info('extracted token from login response body');
-        return token;
-      }
-
-      // Fallback: check Set-Cookie headers for nauk_at
-      const setCookieHeader = loginResponse.headers.get('set-cookie');
-      if (setCookieHeader) {
-        const match = setCookieHeader.match(/nauk_at=([^;]+)/);
-        if (match?.[1]) {
-          logger.info('extracted token from Set-Cookie header');
-          return match[1];
-        }
-      }
-
-      // Last resort: log what we got so user can help debug
-      logger.warn('could not find token in login response', { 
-        responsePreview: JSON.stringify(data).substring(0, 500)
-      });
-      return null;
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.error('login API error', { error: message });
-      return null;
     }
   }
 }

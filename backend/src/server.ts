@@ -1,6 +1,7 @@
 import express from 'express';
 
 import { listProviders, updateProfile } from './controllers/automation.controller';
+import { initLogin, verifyOtp, tokenStatus } from './controllers/auth.controller';
 import { getSupportedProviders } from './automation/provider.registry';
 import { env } from './config/env';
 import { logger } from './config/logger';
@@ -46,11 +47,19 @@ app.get('/health', (_req, res) => {
 
 /**
  * POST /api/profile/update — provider-agnostic by contract.
- * `{"provider":"naukri"}` today, `{"provider":"linkedin"}` once that worker is
- * registered: same route, same controller, same validation.
  */
 app.post('/api/profile/update', asyncHandler(updateProfile));
 app.get('/api/providers', listProviders);
+
+/**
+ * Auth routes for Naukri MFA login flow.
+ * Step 1: POST /api/auth/init-login → triggers OTP email
+ * Step 2: POST /api/auth/verify-otp → verifies OTP, stores token
+ * Check:  GET  /api/auth/token-status → is token still valid?
+ */
+app.post('/api/auth/init-login', asyncHandler(initLogin));
+app.post('/api/auth/verify-otp', asyncHandler(verifyOtp));
+app.get('/api/auth/token-status', asyncHandler(tokenStatus));
 
 app.use(notFoundHandler);
 app.use(errorHandler);

@@ -91,3 +91,24 @@ model AutomationLock {
 
   @@map("automation_locks")
 }
+
+/// Stores Naukri JWT tokens obtained after MFA login.
+/// The worker reads the latest valid token before each run.
+model NaukriToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  
+  /// The JWT access token
+  accessToken String @db.Text
+  
+  /// When the token was issued
+  issuedAt  DateTime @default(now()) @db.Timestamptz(3)
+  
+  /// When the token expires (extracted from JWT exp claim)
+  expiresAt DateTime @db.Timestamptz(3)
+  
+  /// MFA flow ID used to obtain this token (for audit)
+  flowId    String?
+
+  @@index([expiresAt(sort: Desc)])
+  @@map("naukri_tokens")
+}

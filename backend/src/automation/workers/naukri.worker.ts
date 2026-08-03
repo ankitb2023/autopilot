@@ -96,17 +96,36 @@ export class NaukriWorker implements AutomationWorker {
         logger.info('no cookies provided, attempting standard email/password login');
         await page.goto('https://www.naukri.com/nlogin/login', { waitUntil: 'domcontentloaded' });
         
-        // Wait for login fields and fill them slowly to mimic human typing
-        await page.locator('#usernameField').waitFor({ state: 'visible', timeout: 10000 });
-        await page.locator('#usernameField').type(env.NAUKRI_EMAIL, { delay: 100 });
-        
-        await page.locator('#passwordField').type(env.NAUKRI_PASSWORD, { delay: 100 });
-        
-        logger.info('credentials entered, clicking login button');
-        await page.locator('button[type="submit"]').first().click();
-        
-        // Wait for navigation after login
-        await page.waitForTimeout(5000);
+        try {
+          // Wait for login fields and fill them slowly to mimic human typing
+          await page.locator('#usernameField').waitFor({ state: 'visible', timeout: 10000 });
+          await page.locator('#usernameField').type(env.NAUKRI_EMAIL, { delay: 100 });
+          
+          await page.locator('#passwordField').type(env.NAUKRI_PASSWORD, { delay: 100 });
+          
+          logger.info('credentials entered, clicking login button');
+          await page.locator('button[type="submit"]').first().click();
+          
+          // Wait for navigation after login
+          await page.waitForTimeout(5000);
+        } catch (loginError: any) {
+          logger.warn('Failed during login sequence (WAF block or CAPTCHA). Taking screenshot.', { error: loginError.message });
+          let screenshotBase64 = '';
+          try {
+            await page.waitForTimeout(2000); // let any bot-blocker fully render
+            const buffer = await page.screenshot({ type: 'jpeg', quality: 50, fullPage: true });
+            screenshotBase64 = buffer.toString('base64');
+          } catch (e) {}
+
+          return {
+            success: false,
+            message: `Login failed: ${loginError.message}`,
+            details: {
+              url: page.url(),
+              screenshot: screenshotBase64 ? `data:image/jpeg;base64,${screenshotBase64}` : 'Failed to capture'
+            }
+          };
+        }
       }
       
       logger.info('navigating to naukri profile page');

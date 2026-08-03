@@ -83,8 +83,8 @@ export class NaukriWorker implements AutomationWorker {
         try {
           logger.info('waiting for Key skills section');
           
-          // Target the specific "Key skills" widget header and its edit icon
-          const editIcon = page.locator('.widgetHead', { hasText: 'Key skills' }).locator('.edit.icon');
+          // Target the specific "Key skills" widget using its ID container
+          const editIcon = page.locator('#lazyKeySkills .edit.icon');
           
           await editIcon.waitFor({ state: 'visible', timeout: 15000 });
           await editIcon.click();

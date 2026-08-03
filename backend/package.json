@@ -2,7 +2,7 @@
   "name": "autopilot-backend",
   "version": "0.1.0",
   "private": true,
-  "description": "AutoPilot \u2014 provider-based personal automation platform (backend)",
+  "description": "AutoPilot — provider-based personal automation platform (backend)",
   "license": "UNLICENSED",
   "engines": {
     "node": ">=22.0.0"
@@ -22,9 +22,11 @@
     "prisma:studio": "prisma studio"
   },
   "dependencies": {
+    "@playwright/test": "^1.62.1",
     "@prisma/client": "^6.2.1",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
+    "playwright": "^1.62.1",
     "prisma": "^6.2.1",
     "winston": "^3.17.0",
     "zod": "^3.24.1"

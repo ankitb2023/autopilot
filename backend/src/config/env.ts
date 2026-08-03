@@ -31,6 +31,10 @@ const schema = z.object({
    * Acquired by exporting cookies from a logged-in browser session.
    */
   NAUKRI_COOKIES: z.string().optional(),
+
+  /** Login credentials for standard authentication fallback */
+  NAUKRI_EMAIL: z.string().optional(),
+  NAUKRI_PASSWORD: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);

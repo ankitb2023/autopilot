@@ -63,7 +63,7 @@ export class NaukriWorker implements AutomationWorker {
 
       logger.info('calling Naukri profile update API');
 
-      const updateResponse = await fetch(
+      const updateResponse = await globalThis.fetch(
         'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles',
         {
           method: 'POST',
@@ -112,12 +112,14 @@ export class NaukriWorker implements AutomationWorker {
           },
         };
       }
-    } catch (error: any) {
-      logger.error('naukri worker failed', { error: error.message, stack: error.stack });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : undefined;
+      logger.error('naukri worker failed', { error: message, stack });
       return {
         success: false,
         message: 'Failed to update Naukri profile',
-        details: { error: error.message },
+        details: { error: message },
       };
     }
   }
@@ -125,9 +127,9 @@ export class NaukriWorker implements AutomationWorker {
   /**
    * Login to Naukri via their internal API and extract the JWT access token.
    */
-  private async loginViaApi(email: string, password: string, logger: any): Promise<string | null> {
+  private async loginViaApi(email: string, password: string, logger: ExecutionContext['logger']): Promise<string | null> {
     try {
-      const loginResponse = await fetch(
+      const loginResponse = await globalThis.fetch(
         'https://www.naukri.com/central-login-services/v1/login',
         {
           method: 'POST',
@@ -154,10 +156,11 @@ export class NaukriWorker implements AutomationWorker {
       }
 
       // Try to get the token from the response body
-      const data = await loginResponse.json();
+      const data = await loginResponse.json() as Record<string, unknown>;
+      logger.info('login response keys', { keys: Object.keys(data) });
       
       // Naukri login API typically returns the token in one of these fields
-      const token = data?.token || data?.accessToken || data?.access_token || data?.cookies?.nauk_at;
+      const token = (data.token || data.accessToken || data.access_token) as string | undefined;
       
       if (token) {
         logger.info('extracted token from login response body');
@@ -165,26 +168,23 @@ export class NaukriWorker implements AutomationWorker {
       }
 
       // Fallback: check Set-Cookie headers for nauk_at
-      const setCookies = loginResponse.headers.getSetCookie?.() || [];
-      for (const cookie of setCookies) {
-        if (cookie.startsWith('nauk_at=')) {
-          const tokenValue = cookie.split('nauk_at=')[1]?.split(';')[0];
-          if (tokenValue) {
-            logger.info('extracted token from Set-Cookie header');
-            return tokenValue;
-          }
+      const setCookieHeader = loginResponse.headers.get('set-cookie');
+      if (setCookieHeader) {
+        const match = setCookieHeader.match(/nauk_at=([^;]+)/);
+        if (match?.[1]) {
+          logger.info('extracted token from Set-Cookie header');
+          return match[1];
         }
       }
 
       // Last resort: log what we got so user can help debug
       logger.warn('could not find token in login response', { 
-        bodyKeys: Object.keys(data),
-        setCookieCount: setCookies.length,
-        responsePreview: JSON.stringify(data).substring(0, 300)
+        responsePreview: JSON.stringify(data).substring(0, 500)
       });
       return null;
-    } catch (error: any) {
-      logger.error('login API error', { error: error.message });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error('login API error', { error: message });
       return null;
     }
   }

@@ -4,78 +4,116 @@ import { loadCookieJar, toCookieHeader } from './cookies';
 /**
  * Read-only profile fetch.
  *
- * Two jobs, both diagnostic:
+ * Reports the profile's current `keySkills` and id — the values NAUKRI_KEY_SKILLS and
+ * NAUKRI_PROFILE_ID must hold. Guessing those and then writing would overwrite a real
+ * profile with a stale skills list, so this exists to be run before the first write.
  *
- *  1. It is the only authenticated Naukri call we can make without writing anything,
- *     so it answers "does a token minted at one IP work from another?" — the access
- *     token embeds an `ipAdress` claim, and whether Naukri enforces it decides whether
- *     this can run on Render at all.
- *
- *  2. It reports the profile's current `keySkills` and id, which is what
- *     NAUKRI_KEY_SKILLS and NAUKRI_PROFILE_ID must be set to. Guessing those and then
- *     writing would overwrite a real profile with a stale skills list.
+ * The URL is *not* the write endpoint: `v1/users/self/fullprofiles` answers GET with
+ * 405. The path below is what their suggester plugin uses to read `keySkills`, with the
+ * `AppId: 135` it sends. A second candidate follows as a fallback (`USER_PROFILE_API_URL`
+ * in their browser config) since neither is documented as canonical.
  */
 
-const PROFILE_URL =
-  'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles';
+interface ReadCandidate {
+  url: string;
+  appId: string;
+}
+
+const READ_CANDIDATES: ReadCandidate[] = [
+  {
+    url: 'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v0/users/self?expand_level=2',
+    appId: '135',
+  },
+  {
+    url: 'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v2/users/self',
+    appId: '105',
+  },
+];
+
+export interface ProfileAttempt {
+  url: string;
+  status: number;
+  bytes: number;
+}
 
 export interface ProfileSnapshot {
-  status: number;
   ok: boolean;
+  /** Which candidate answered. */
+  source?: string;
   profileId?: string;
   keySkills?: string;
-  /** Truncated raw body, so an unexpected shape is still debuggable. */
+  attempts: ProfileAttempt[];
   bodyPreview: string;
 }
 
 export async function fetchProfile(token: string, logger: Logger): Promise<ProfileSnapshot> {
   const jar = await loadCookieJar();
   const cookieHeader = toCookieHeader(jar);
+  const attempts: ProfileAttempt[] = [];
 
-  const response = await globalThis.fetch(PROFILE_URL, {
-    method: 'GET',
-    headers: {
-      accept: 'application/json',
-      authorization: `Bearer ${token}`,
-      appid: '105',
-      clientid: 'd3skt0p',
-      systemid: 'Naukri',
-      'x-requested-with': 'XMLHttpRequest',
-      referer: 'https://www.naukri.com/mnjuser/profile',
-      'user-agent':
-        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
-      ...(cookieHeader ? { cookie: cookieHeader } : {}),
-    },
-  });
+  for (const candidate of READ_CANDIDATES) {
+    const response = await globalThis.fetch(candidate.url, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        authorization: `Bearer ${token}`,
+        appid: candidate.appId,
+        systemid: 'Naukri',
+        'x-requested-with': 'XMLHttpRequest',
+        referer: 'https://www.naukri.com/mnjuser/profile',
+        'user-agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
+      },
+    });
 
-  const text = await response.text().catch(() => '');
-  logger.info('naukri profile fetch', { status: response.status, bytes: text.length });
+    const text = await response.text().catch(() => '');
+    attempts.push({ url: candidate.url, status: response.status, bytes: text.length });
+    logger.info('naukri profile read attempt', { status: response.status, bytes: text.length });
 
-  const snapshot: ProfileSnapshot = {
-    status: response.status,
-    ok: response.ok,
-    bodyPreview: text.slice(0, 400),
-  };
+    if (!response.ok) continue;
 
-  // The response nests the profile differently across versions, so probe the likely
-  // shapes rather than asserting one.
-  try {
-    const parsed: unknown = JSON.parse(text);
-    const root = asRecord(parsed);
-    const profile = asRecord(root.profile ?? asRecord(root.dashboardProfile).profile ?? root);
-
-    const keySkills = profile.keySkills ?? root.keySkills;
-    if (typeof keySkills === 'string') snapshot.keySkills = keySkills;
-
-    const profileId = root.profileId ?? profile.profileId ?? profile.id;
-    if (typeof profileId === 'string') snapshot.profileId = profileId;
-  } catch {
-    // Leave the preview for inspection; a non-JSON body is itself the finding.
+    return { ok: true, source: candidate.url, ...extract(text), attempts, bodyPreview: text.slice(0, 600) };
   }
 
-  return snapshot;
+  return { ok: false, attempts, bodyPreview: '' };
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+/**
+ * Digs `keySkills` and the profile id out of the response.
+ *
+ * Walks the whole tree for those two keys rather than assuming a path, because the
+ * shape differs between the candidate endpoints.
+ */
+function extract(text: string): { keySkills?: string; profileId?: string } {
+  const result: { keySkills?: string; profileId?: string } = {};
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return result;
+  }
+
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    if (node === null || typeof node !== 'object') return;
+
+    for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'keySkills' && typeof value === 'string' && !result.keySkills) {
+        result.keySkills = value;
+      }
+      if (key === 'profileId' && typeof value === 'string' && !result.profileId) {
+        result.profileId = value;
+      }
+      walk(value);
+    }
+  };
+
+  walk(parsed);
+  return result;
 }

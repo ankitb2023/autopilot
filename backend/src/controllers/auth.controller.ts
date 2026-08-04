@@ -271,12 +271,13 @@ export async function naukriProfile(_req: Request, res: Response): Promise<void>
 
   res.status(snapshot.ok ? 200 : 502).json({
     status: snapshot.ok ? 'OK' : 'FAILED',
-    httpStatus: snapshot.status,
+    source: snapshot.source,
     profileId: snapshot.profileId,
     keySkills: snapshot.keySkills,
     hint: snapshot.ok
       ? 'Set NAUKRI_KEY_SKILLS to the keySkills value above, verbatim, before running a non-dry update.'
-      : 'A 401 here means the token was rejected from this host — likely the IP claim embedded in it.',
+      : 'No read endpoint answered. `attempts` shows each candidate: 401 = token rejected, 405 = wrong method, 404 = wrong path.',
+    attempts: snapshot.attempts,
     bodyPreview: snapshot.bodyPreview,
   });
 }

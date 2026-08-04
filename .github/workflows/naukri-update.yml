@@ -2,9 +2,10 @@ name: Naukri Profile Update
 
 on:
   schedule:
-    # Twice daily: 9 AM IST (3:30 AM UTC) and 6 PM IST (12:30 PM UTC)
-    - cron: '30 3 * * *'
-    - cron: '30 12 * * *'
+    # 8:30 AM IST = 3:00 AM UTC
+    - cron: '0 3 * * *'
+    # 8:00 PM IST = 2:30 PM UTC
+    - cron: '30 14 * * *'
   workflow_dispatch: # Allow manual trigger from GitHub UI
 
 jobs:
@@ -15,6 +16,8 @@ jobs:
     steps:
       - name: Trigger Naukri profile update
         run: |
+          echo "=== Triggering Naukri profile update ==="
+          
           response=$(curl -s -w "\n%{http_code}" -X POST \
             "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/profile/update" \
             -H "Content-Type: application/json" \
@@ -26,10 +29,9 @@ jobs:
           echo "HTTP Status: $http_code"
           echo "Response: $body"
           
-          # Fail the workflow if the API returned an error
           if [ "$http_code" -ge 400 ]; then
             echo "::error::Profile update failed with HTTP $http_code"
             exit 1
           fi
           
-          echo "✅ Profile update triggered successfully"
+          echo "✅ Profile update completed successfully"

@@ -1,7 +1,15 @@
 import express from 'express';
 
 import { listProviders, updateProfile } from './controllers/automation.controller';
-import { initLogin, verifyOtp, tokenStatus, storeToken } from './controllers/auth.controller';
+import {
+  authStatus,
+  initLogin,
+  probe,
+  refresh,
+  resetSession,
+  storeToken,
+  verifyOtp,
+} from './controllers/auth.controller';
 import { getSupportedProviders } from './automation/provider.registry';
 import { env } from './config/env';
 import { logger } from './config/logger';
@@ -51,16 +59,25 @@ app.get('/health', (_req, res) => {
 app.post('/api/profile/update', asyncHandler(updateProfile));
 app.get('/api/providers', listProviders);
 
-/**
- * Auth routes for Naukri MFA login flow.
- * Step 1: POST /api/auth/init-login → triggers OTP email
- * Step 2: POST /api/auth/verify-otp → verifies OTP, stores token
- * Check:  GET  /api/auth/token-status → is token still valid?
+/*
+ * Naukri auth. Interactive by necessity — an OTP needs a human — but the goal is to
+ * need it once, after which stored cookies let the worker re-login silently.
+ *
+ *   POST /api/auth/init-login    password login; returns MFA_REQUIRED or a token
+ *   POST /api/auth/verify-otp    { otp, flowId } — completes MFA, captures cookies
+ *   POST /api/auth/refresh       forces a silent re-login; THE test for unattended use
+ *   GET  /api/auth/status        token validity + which cookies are held
+ *   GET  /api/auth/probe         resolves a token exactly as the worker does
+ *   POST /api/auth/store-token   manual paste-from-browser escape hatch
+ *   DELETE /api/auth/session     drop a stale cookie jar
  */
 app.post('/api/auth/init-login', asyncHandler(initLogin));
 app.post('/api/auth/verify-otp', asyncHandler(verifyOtp));
-app.get('/api/auth/token-status', asyncHandler(tokenStatus));
+app.post('/api/auth/refresh', asyncHandler(refresh));
+app.get('/api/auth/status', asyncHandler(authStatus));
+app.get('/api/auth/probe', asyncHandler(probe));
 app.post('/api/auth/store-token', asyncHandler(storeToken));
+app.delete('/api/auth/session', asyncHandler(resetSession));
 
 app.use(notFoundHandler);
 app.use(errorHandler);

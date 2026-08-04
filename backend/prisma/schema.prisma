@@ -92,6 +92,29 @@ model AutomationLock {
   @@map("automation_locks")
 }
 
+/// The Naukri cookie jar — a single row, persisted across restarts and deploys.
+///
+/// This is the load-bearing piece for unattended operation. `fetch` has no cookie
+/// jar, so without this every request looks like a brand-new unrecognised device to
+/// Naukri and every login re-triggers MFA. Whatever Naukri hands back after an OTP
+/// verification (device trust, refresh credential, session identifiers) lives here
+/// and is replayed on subsequent logins.
+///
+/// Cookies are stored as a flat `{ name: value }` object rather than raw Set-Cookie
+/// strings: we only ever need to echo them back, and attributes like Path/Domain are
+/// irrelevant when we talk to exactly one host.
+model NaukriSession {
+  /// Fixed key — AutoPilot is single-account, so there is exactly one session row.
+  id String @id @default("default")
+
+  /// `{ cookieName: value }`.
+  cookies Json
+
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@map("naukri_sessions")
+}
+
 /// Stores Naukri JWT tokens obtained after MFA login.
 /// The worker reads the latest valid token before each run.
 model NaukriToken {

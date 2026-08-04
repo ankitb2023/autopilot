@@ -1,3 +1,8 @@
+import { env } from '../../config/env';
+import type { Logger } from '../../config/logger';
+import { AutomationFailedError } from '../../core/errors';
+import { loadCookieJar, mergeSetCookies, saveCookieJar, toCookieHeader } from '../naukri/cookies';
+import { getAccessToken, refreshAccessToken } from '../naukri/naukri.auth';
 import type {
   AutomationAction,
   AutomationWorker,
@@ -5,125 +10,136 @@ import type {
   ProviderId,
   WorkerOutcome,
 } from '../types';
-import { env } from '../../config/env';
-import { prisma } from '../../config/prisma';
 
 /**
- * Naukri automation worker — Direct API approach.
- * 
- * Uses a stored JWT token (obtained via the /api/auth MFA flow) to call
- * Naukri's profile update API directly. No browser needed.
+ * Naukri worker — direct API, no browser.
+ *
+ * Playwright was abandoned here for a good reason: Naukri sits behind Akamai bot
+ * detection, which served a blank page and an access-denied interstitial. Driving the
+ * same JSON API the site's own frontend calls avoids that fight entirely.
+ *
+ * Re-saving the profile's key skills is what refreshes the "last updated" timestamp
+ * recruiters sort by — the skills themselves are unchanged, which is why this is
+ * idempotent and safe to run daily.
  */
+
+const PROFILE_URL =
+  'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles';
+
 export class NaukriWorker implements AutomationWorker {
   readonly provider: ProviderId = 'naukri';
   readonly supportedActions: readonly AutomationAction[] = ['profile.update'];
 
   async execute({ logger, dryRun, signal }: ExecutionContext): Promise<WorkerOutcome> {
-    logger.info('naukri worker starting (API mode)', { dryRun });
+    const profileId = env.NAUKRI_PROFILE_ID;
+    if (!profileId) {
+      throw new AutomationFailedError(
+        'NAUKRI_PROFILE_ID is not set. Capture it from the Network tab while saving your profile.',
+      );
+    }
+
     signal.throwIfAborted();
 
-    try {
-      // ── Step 1: Get a valid token from the database ──────────────────
-      const storedToken = await prisma.naukriToken.findFirst({
-        where: { expiresAt: { gt: new Date() } },
-        orderBy: { expiresAt: 'desc' },
-      });
+    // Throws NaukriReauthRequiredError (503, actionable) if a silent re-login fails.
+    let token = await getAccessToken(logger);
 
-      if (!storedToken) {
-        return {
-          success: false,
-          message: 'No valid Naukri token found. Please authenticate first via POST /api/auth/init-login → POST /api/auth/verify-otp.',
-          details: {},
-        };
-      }
+    if (dryRun) {
+      logger.info('dry run: holding a valid token, skipping the write');
+      return { success: true, message: 'Dry run: authenticated, profile not modified.' };
+    }
 
-      const minutesRemaining = Math.round((storedToken.expiresAt.getTime() - Date.now()) / 60000);
-      logger.info('using stored token', { expiresAt: storedToken.expiresAt.toISOString(), minutesRemaining });
+    signal.throwIfAborted();
 
-      if (minutesRemaining < 5) {
-        logger.warn('token is about to expire, update may fail');
-      }
+    let response = await this.saveProfile(token, profileId, logger);
 
+    /*
+     * 401 handling — the part that was missing before.
+     *
+     * A token can pass our expiry check and still be rejected: Naukri may revoke it
+     * early, or the clock skew is unlucky. One forced re-login and one retry is the
+     * right amount of persistence — beyond that we would be hammering a login
+     * endpoint with credentials, which is how accounts get locked.
+     */
+    if (response.status === 401) {
+      logger.warn('profile save rejected the token; forcing re-login and retrying once');
+      token = await refreshAccessToken(logger);
       signal.throwIfAborted();
+      response = await this.saveProfile(token, profileId, logger);
+    }
 
-      if (dryRun) {
-        logger.info('dry run: skipping actual profile update');
-        return { success: true, message: 'Dry run completed — valid token found.', details: { dryRun: true, minutesRemaining } };
-      }
-
-      // ── Step 2: Update profile via API ───────────────────────────────
-      const keySkills = env.NAUKRI_KEY_SKILLS 
-        || 'Core Java Programming,React.js,Javascript,Redux,Spring Boot,Elastic Search,Kibana,Redis,SQL,DBMS,HTML,CSS,Software Development,Software Engineering,GIT,TypeScript,Nextjs,Data Structures and Algorithms,System Design,Jenkins,Rest API Design';
-
-      const profileId = env.NAUKRI_PROFILE_ID;
-      if (!profileId) {
-        return {
-          success: false,
-          message: 'NAUKRI_PROFILE_ID is not set. Get it from browser Network tab when saving profile.',
-          details: {},
-        };
-      }
-
-      logger.info('calling Naukri profile update API');
-
-      const updateResponse = await globalThis.fetch(
-        'https://www.naukri.com/cloudgateway-mynaukri/resman-aggregator-services/v1/users/self/fullprofiles',
-        {
-          method: 'POST',
-          headers: {
-            'accept': 'application/json',
-            'content-type': 'application/json',
-            'authorization': `Bearer ${storedToken.accessToken}`,
-            'appid': '105',
-            'clientid': 'd3skt0p',
-            'systemid': 'Naukri',
-            'x-http-method-override': 'PUT',
-            'x-requested-with': 'XMLHttpRequest',
-            'origin': 'https://www.naukri.com',
-            'referer': 'https://www.naukri.com/mnjuser/profile',
-            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-          },
-          body: JSON.stringify({
-            profile: { keySkills },
-            profileId,
-          }),
-        }
+    if (response.status === 401) {
+      throw new AutomationFailedError(
+        'Naukri rejected a freshly issued token. The account likely needs interactive re-authentication.',
+        { status: 401 },
       );
+    }
 
-      const responseText = await updateResponse.text();
-      logger.info('profile update response', { 
-        status: updateResponse.status, 
-        body: responseText.substring(0, 500) 
-      });
-
-      if (updateResponse.ok) {
-        return {
-          success: true,
-          message: 'Naukri profile updated successfully via API!',
-          details: { 
-            status: updateResponse.status, 
-            response: responseText.substring(0, 200) 
-          },
-        };
-      } else {
-        return {
-          success: false,
-          message: `Profile update API returned ${updateResponse.status}`,
-          details: { 
-            status: updateResponse.status, 
-            body: responseText.substring(0, 500) 
-          },
-        };
-      }
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      const stack = error instanceof Error ? error.stack : undefined;
-      logger.error('naukri worker failed', { error: message, stack });
+    if (!response.ok) {
+      // A non-401 rejection is a genuine failure worth surfacing verbatim: it is how
+      // we will find out the API contract changed.
       return {
         success: false,
-        message: 'Failed to update Naukri profile',
-        details: { error: message },
+        message: `Naukri profile save returned HTTP ${response.status}.`,
+        details: { status: response.status, body: response.bodyPreview },
       };
     }
+
+    logger.info('naukri profile saved');
+    return {
+      success: true,
+      message: 'Naukri profile updated.',
+      details: { status: response.status },
+    };
+  }
+
+  /**
+   * Re-saves the profile's key skills.
+   *
+   * Sends the cookie jar alongside the bearer token: the gateway has been observed to
+   * care about session cookies as well, and replaying them keeps this request
+   * indistinguishable from the browser's.
+   */
+  private async saveProfile(
+    token: string,
+    profileId: string,
+    logger: Logger,
+  ): Promise<{ ok: boolean; status: number; bodyPreview: string }> {
+    const keySkills = env.NAUKRI_KEY_SKILLS;
+    if (!keySkills) {
+      throw new AutomationFailedError(
+        'NAUKRI_KEY_SKILLS is not set. It must hold your current comma-separated skills, which are re-saved unchanged.',
+      );
+    }
+
+    const jar = await loadCookieJar();
+    const cookieHeader = toCookieHeader(jar);
+
+    const response = await globalThis.fetch(PROFILE_URL, {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        authorization: `Bearer ${token}`,
+        appid: '105',
+        clientid: 'd3skt0p',
+        systemid: 'Naukri',
+        // The gateway routes PUT semantics through POST via this override.
+        'x-http-method-override': 'PUT',
+        'x-requested-with': 'XMLHttpRequest',
+        origin: 'https://www.naukri.com',
+        referer: 'https://www.naukri.com/mnjuser/profile',
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
+      },
+      body: JSON.stringify({ profile: { keySkills }, profileId }),
+    });
+
+    await saveCookieJar(mergeSetCookies(jar, response.headers));
+
+    const bodyPreview = (await response.text().catch(() => '')).slice(0, 500);
+    logger.info('naukri profile save response', { status: response.status, bodyPreview });
+
+    return { ok: response.ok, status: response.status, bodyPreview };
   }
 }

@@ -1,308 +1,179 @@
 import type { Request, Response } from 'express';
-import { prisma } from '../config/prisma';
-import { env } from '../config/env';
+import { z } from 'zod';
+
+import { clearCookieJar, cookieNames, loadCookieJar } from '../automation/naukri/cookies';
+import {
+  attemptLogin,
+  getAccessToken,
+  readJwtExpiry,
+  refreshAccessToken,
+  storeAccessToken,
+} from '../automation/naukri/naukri.auth';
 import { logger } from '../config/logger';
+import { prisma } from '../config/prisma';
+import { AppError } from '../core/errors';
+
+/**
+ * Naukri authentication endpoints.
+ *
+ * These exist for the one thing that cannot be automated: supplying an OTP. The goal
+ * is to need them **once**. Every login here captures Naukri's full cookie jar, so a
+ * later unattended re-login can present itself as the same known device.
+ */
 
 /**
  * POST /api/auth/init-login
- * 
- * Step 1 of MFA login: calls Naukri's login API with email/password.
- * Since we're calling from a cloud IP, Naukri triggers MFA and sends an OTP to the user's email.
- * Returns the flowId needed for Step 2.
+ *
+ * Tries a password-only login. If Naukri accepts it, we're done and no OTP was needed
+ * — which is also the test for whether the device is now trusted.
  */
 export async function initLogin(_req: Request, res: Response): Promise<void> {
-  if (!env.NAUKRI_EMAIL || !env.NAUKRI_PASSWORD) {
-    res.status(400).json({ error: 'NAUKRI_EMAIL and NAUKRI_PASSWORD must be set in environment.' });
+  const attempt = await attemptLogin(logger);
+
+  if (attempt.mfaRequired) {
+    res.status(200).json({
+      status: 'MFA_REQUIRED',
+      message: 'OTP sent to your registered email. Post it to /api/auth/verify-otp.',
+      flowId: attempt.flowId,
+      email: attempt.email,
+    });
     return;
   }
 
-  try {
-    const loginResponse = await globalThis.fetch(
-      'https://www.naukri.com/central-login-services/v1/login',
-      {
-        method: 'POST',
-        headers: {
-          'accept': 'application/json',
-          'content-type': 'application/json',
-          'appid': '105',
-          'systemid': 'jobseeker',
-          'clientid': 'd3skt0p',
-          'x-requested-with': 'XMLHttpRequest',
-          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-          'origin': 'https://www.naukri.com',
-          'referer': 'https://www.naukri.com/nlogin/login',
-        },
-        body: JSON.stringify({ username: env.NAUKRI_EMAIL, password: env.NAUKRI_PASSWORD }),
-      }
-    );
-
-    const data = await loginResponse.json() as Record<string, unknown>;
-    
-    if (loginResponse.status === 403 && data.message === 'MFA required') {
-      const mfaData = data.data as Record<string, unknown>;
-      res.json({
-        status: 'MFA_REQUIRED',
-        message: 'OTP has been sent to your email. Use /api/auth/verify-otp to complete login.',
-        flowId: mfaData.flowId,
-        email: mfaData.email,
-      });
-      return;
-    }
-
-    if (loginResponse.ok) {
-      // Direct login succeeded (no MFA) — extract and store token
-      const token = await extractAndStoreToken(data, loginResponse.headers, null);
-      if (token) {
-        res.json({ status: 'LOGIN_SUCCESS', message: 'Logged in successfully. Token stored.' });
-      } else {
-        res.status(500).json({ status: 'TOKEN_EXTRACTION_FAILED', data });
-      }
-      return;
-    }
-
-    res.status(loginResponse.status).json({ 
-      status: 'LOGIN_FAILED', 
-      naukriResponse: data 
+  if (attempt.accessToken) {
+    res.json({
+      status: 'LOGIN_SUCCESS',
+      message: 'Logged in without OTP — this device is trusted. Automation can self-renew.',
+      expiresAt: attempt.expiresAt?.toISOString(),
     });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error('init-login failed', { error: message });
-    res.status(500).json({ error: message });
+    return;
   }
+
+  res.status(502).json({
+    status: 'LOGIN_FAILED',
+    message: `Naukri returned HTTP ${attempt.status} without a token.`,
+    naukriResponse: attempt.body,
+  });
 }
 
+const verifyOtpSchema = z.object({
+  otp: z.string().min(4).max(10),
+  flowId: z.string().min(1),
+});
+
 /**
- * POST /api/auth/verify-otp
- * Body: { "otp": "123456", "flowId": "mfa-login-email" }
- * 
- * Step 2 of MFA login: verifies the OTP sent to the user's email.
- * On success, stores the JWT token in the database for automated use.
+ * POST /api/auth/verify-otp — body `{ otp, flowId }`
+ *
+ * Completes MFA. The cookies captured here are what make later unattended logins
+ * possible, so the response reports which ones arrived.
  */
 export async function verifyOtp(req: Request, res: Response): Promise<void> {
-  const { otp, flowId } = req.body as { otp?: string; flowId?: string };
+  const { otp, flowId } = verifyOtpSchema.parse(req.body);
 
-  if (!otp || !flowId) {
-    res.status(400).json({ error: 'Both "otp" and "flowId" are required.' });
-    return;
-  }
+  const attempt = await attemptLogin(logger, { otp, flowId });
 
-  if (!env.NAUKRI_EMAIL || !env.NAUKRI_PASSWORD) {
-    res.status(400).json({ error: 'NAUKRI_EMAIL and NAUKRI_PASSWORD must be set.' });
-    return;
-  }
-
-  try {
-    const verifyResponse = await globalThis.fetch(
-      'https://www.naukri.com/central-login-services/v1/login',
-      {
-        method: 'POST',
-        headers: {
-          'accept': 'application/json',
-          'content-type': 'application/json',
-          'appid': '105',
-          'systemid': 'jobseeker',
-          'clientid': 'd3skt0p',
-          'x-requested-with': 'XMLHttpRequest',
-          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-          'origin': 'https://www.naukri.com',
-          'referer': 'https://www.naukri.com/nlogin/login',
-        },
-        body: JSON.stringify({
-          username: env.NAUKRI_EMAIL,
-          password: env.NAUKRI_PASSWORD,
-          otp,
-          flowId,
-        }),
-      }
-    );
-
-    const data = await verifyResponse.json() as Record<string, unknown>;
-    logger.info('OTP verify response', { status: verifyResponse.status, keys: Object.keys(data) });
-
-    if (verifyResponse.ok) {
-      const token = await extractAndStoreToken(data, verifyResponse.headers, flowId);
-      if (token) {
-        res.json({ 
-          status: 'SUCCESS', 
-          message: 'OTP verified! Token stored. Automated profile updates will now work.' 
-        });
-      } else {
-        // Return the full response so user can help debug
-        res.status(500).json({ 
-          status: 'TOKEN_EXTRACTION_FAILED', 
-          message: 'Login succeeded but could not find token. See response.',
-          naukriResponse: data,
-          setCookie: verifyResponse.headers.get('set-cookie')?.substring(0, 200),
-        });
-      }
-      return;
-    }
-
-    res.status(verifyResponse.status).json({ 
-      status: 'VERIFY_FAILED', 
-      naukriResponse: data 
+  if (attempt.accessToken) {
+    const jar = await loadCookieJar();
+    res.json({
+      status: 'SUCCESS',
+      message: 'OTP verified and token stored.',
+      expiresAt: attempt.expiresAt?.toISOString(),
+      cookiesCaptured: cookieNames(jar),
+      nextStep:
+        'Call POST /api/auth/refresh to check whether a password-only re-login now works. If it does, the automation is fully unattended.',
     });
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    logger.error('verify-otp failed', { error: message });
-    res.status(500).json({ error: message });
+    return;
   }
-}
 
-/**
- * GET /api/auth/token-status
- * 
- * Check if we have a valid stored token.
- */
-export async function tokenStatus(_req: Request, res: Response): Promise<void> {
-  const token = await prisma.naukriToken.findFirst({
-    where: { expiresAt: { gt: new Date() } },
-    orderBy: { expiresAt: 'desc' },
-    select: { id: true, issuedAt: true, expiresAt: true, flowId: true },
+  res.status(400).json({
+    status: 'VERIFY_FAILED',
+    message: attempt.mfaRequired
+      ? 'Naukri still wants an OTP — the code may be wrong or expired.'
+      : `Naukri returned HTTP ${attempt.status}.`,
+    naukriResponse: attempt.body,
   });
-
-  if (token) {
-    res.json({ 
-      status: 'VALID', 
-      issuedAt: token.issuedAt, 
-      expiresAt: token.expiresAt,
-      minutesRemaining: Math.round((token.expiresAt.getTime() - Date.now()) / 60000),
-    });
-  } else {
-    res.json({ 
-      status: 'EXPIRED_OR_MISSING', 
-      message: 'No valid token. Use POST /api/auth/store-token to paste your bearer token.' 
-    });
-  }
 }
 
 /**
- * POST /api/auth/store-token
- * Body: { "token": "eyJraWQ..." }
- * 
- * Directly store a bearer token copied from your browser.
- * How to get it: Open Naukri in Chrome → DevTools → Application → Cookies → copy `nauk_at` value.
+ * POST /api/auth/refresh
+ *
+ * Forces a silent re-login — the exact operation the scheduled run depends on. Run
+ * this once after verifying an OTP: if it succeeds, unattended operation works. If it
+ * returns 503, it does not, and no amount of scheduling will fix that.
+ */
+export async function refresh(_req: Request, res: Response): Promise<void> {
+  const token = await refreshAccessToken(logger);
+  res.json({
+    status: 'REFRESHED',
+    message: 'Silent re-login succeeded — no OTP required. Unattended runs will work.',
+    expiresAt: readJwtExpiry(token).toISOString(),
+  });
+}
+
+/** GET /api/auth/status — token validity plus which cookies are held. */
+export async function authStatus(_req: Request, res: Response): Promise<void> {
+  const [token, jar] = await Promise.all([
+    prisma.naukriToken.findFirst({
+      where: { expiresAt: { gt: new Date() } },
+      orderBy: { expiresAt: 'desc' },
+      select: { issuedAt: true, expiresAt: true, flowId: true },
+    }),
+    loadCookieJar(),
+  ]);
+
+  res.json({
+    token: token
+      ? {
+          status: 'VALID',
+          issuedAt: token.issuedAt,
+          expiresAt: token.expiresAt,
+          minutesRemaining: Math.round((token.expiresAt.getTime() - Date.now()) / 60_000),
+          obtainedVia: token.flowId,
+        }
+      : { status: 'EXPIRED_OR_MISSING' },
+    session: { cookiesHeld: cookieNames(jar) },
+  });
+}
+
+const storeTokenSchema = z.object({ token: z.string().min(20) });
+
+/**
+ * POST /api/auth/store-token — body `{ token }`
+ *
+ * Manual escape hatch: paste a bearer token from your browser. Kept because it works
+ * when nothing else does, but note it only buys about an hour — it is a debugging
+ * tool, not a substitute for silent re-login.
  */
 export async function storeToken(req: Request, res: Response): Promise<void> {
-  const { token } = req.body as { token?: string };
-
-  if (!token) {
-    res.status(400).json({ 
-      error: 'Provide "token" in the body. Get it from Chrome DevTools → Application → Cookies → nauk_at value.' 
-    });
-    return;
-  }
-
-  // Decode JWT to get expiry
-  let expiresAt = new Date(Date.now() + 3600 * 1000); // default 1 hour
-  try {
-    const parts = token.split('.');
-    if (parts.length === 3 && parts[1]) {
-      const payload = JSON.parse(
-        Buffer.from(parts[1], 'base64url').toString()
-      ) as Record<string, unknown>;
-      if (typeof payload.exp === 'number') {
-        expiresAt = new Date(payload.exp * 1000);
-      }
-      logger.info('decoded JWT', { 
-        userId: payload.userId, 
-        expiresAt: expiresAt.toISOString(),
-        minutesRemaining: Math.round((expiresAt.getTime() - Date.now()) / 60000),
-      });
-    }
-  } catch {
-    logger.warn('could not decode JWT expiry, defaulting to 1 hour');
-  }
+  const { token } = storeTokenSchema.parse(req.body);
+  const expiresAt = readJwtExpiry(token);
 
   if (expiresAt.getTime() <= Date.now()) {
-    res.status(400).json({ error: 'This token has already expired. Please copy a fresh one from your browser.' });
-    return;
+    throw new AppError('That token has already expired.', 400, 'TOKEN_EXPIRED');
   }
 
-  // Store in database
-  await prisma.naukriToken.create({
-    data: { accessToken: token, expiresAt, flowId: 'manual' },
-  });
+  await storeAccessToken(token, expiresAt, 'manual');
 
-  const minutesRemaining = Math.round((expiresAt.getTime() - Date.now()) / 60000);
-  res.json({ 
-    status: 'STORED', 
-    message: `Token stored successfully! Valid for ~${minutesRemaining} minutes. Run profile update now!`,
+  res.json({
+    status: 'STORED',
     expiresAt: expiresAt.toISOString(),
-    minutesRemaining,
+    minutesRemaining: Math.round((expiresAt.getTime() - Date.now()) / 60_000),
   });
 }
 
 /**
- * Extract JWT token from Naukri API response and store it in the database.
+ * DELETE /api/auth/session
+ *
+ * Drops the cookie jar. Needed when the stored cookies go stale — a jar holding a
+ * dead session can make every login fail in ways a clean attempt would not.
  */
-async function extractAndStoreToken(
-  data: Record<string, unknown>, 
-  headers: Headers, 
-  flowId: string | null
-): Promise<boolean> {
-  let accessToken: string | null = null;
+export async function resetSession(_req: Request, res: Response): Promise<void> {
+  await clearCookieJar();
+  res.json({ status: 'CLEARED', message: 'Cookie jar dropped. Next login starts fresh.' });
+}
 
-  // Try response body fields
-  const possibleFields = ['token', 'accessToken', 'access_token', 'nauk_at'];
-  for (const field of possibleFields) {
-    if (typeof data[field] === 'string') {
-      accessToken = data[field] as string;
-      logger.info(`found token in response body field: ${field}`);
-      break;
-    }
-  }
-
-  // Try nested data object
-  if (!accessToken && data.data && typeof data.data === 'object') {
-    const nested = data.data as Record<string, unknown>;
-    for (const field of possibleFields) {
-      if (typeof nested[field] === 'string') {
-        accessToken = nested[field] as string;
-        logger.info(`found token in response body data.${field}`);
-        break;
-      }
-    }
-  }
-
-  // Try Set-Cookie header for nauk_at
-  if (!accessToken) {
-    const setCookie = headers.get('set-cookie');
-    if (setCookie) {
-      const match = setCookie.match(/nauk_at=([^;]+)/);
-      if (match?.[1]) {
-        accessToken = match[1];
-        logger.info('found token in Set-Cookie header (nauk_at)');
-      }
-    }
-  }
-
-  if (!accessToken) {
-    logger.warn('could not find token in response', { 
-      bodyKeys: Object.keys(data),
-      dataPreview: JSON.stringify(data).substring(0, 500),
-    });
-    return false;
-  }
-
-  // Decode JWT to get expiry (JWT is base64url encoded, payload is the 2nd segment)
-  let expiresAt = new Date(Date.now() + 3600 * 1000); // default 1 hour
-  try {
-    const payload = JSON.parse(
-      Buffer.from(accessToken.split('.')[1]!, 'base64url').toString()
-    ) as Record<string, unknown>;
-    if (typeof payload.exp === 'number') {
-      expiresAt = new Date(payload.exp * 1000);
-    }
-  } catch {
-    logger.warn('could not decode JWT expiry, defaulting to 1 hour');
-  }
-
-  // Store in database
-  await prisma.naukriToken.create({
-    data: { accessToken, expiresAt, flowId },
-  });
-
-  logger.info('token stored in database', { expiresAt: expiresAt.toISOString() });
-  return true;
+/** GET /api/auth/probe — resolves a usable token the way the worker does. */
+export async function probe(_req: Request, res: Response): Promise<void> {
+  const token = await getAccessToken(logger);
+  res.json({ status: 'OK', expiresAt: readJwtExpiry(token).toISOString() });
 }

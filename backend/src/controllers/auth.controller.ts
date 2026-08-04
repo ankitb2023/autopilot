@@ -18,6 +18,7 @@ import {
   storeAccessToken,
   verifyMfaOtp,
 } from '../automation/naukri/naukri.auth';
+import { fetchProfile } from '../automation/naukri/naukri.profile';
 import { logger } from '../config/logger';
 import { prisma } from '../config/prisma';
 import { AppError } from '../core/errors';
@@ -255,4 +256,27 @@ export async function seedSession(req: Request, res: Response): Promise<void> {
 export async function probe(_req: Request, res: Response): Promise<void> {
   const token = await getAccessToken(logger);
   res.json({ status: 'OK', expiresAt: readJwtExpiry(token).toISOString() });
+}
+
+/**
+ * GET /api/naukri/profile
+ *
+ * Read-only. Reports the profile's current keySkills and id — the values
+ * NAUKRI_KEY_SKILLS and NAUKRI_PROFILE_ID must hold — and, because it is a genuine
+ * authenticated call, proves whether the token works from this host's IP.
+ */
+export async function naukriProfile(_req: Request, res: Response): Promise<void> {
+  const token = await getAccessToken(logger);
+  const snapshot = await fetchProfile(token, logger);
+
+  res.status(snapshot.ok ? 200 : 502).json({
+    status: snapshot.ok ? 'OK' : 'FAILED',
+    httpStatus: snapshot.status,
+    profileId: snapshot.profileId,
+    keySkills: snapshot.keySkills,
+    hint: snapshot.ok
+      ? 'Set NAUKRI_KEY_SKILLS to the keySkills value above, verbatim, before running a non-dry update.'
+      : 'A 401 here means the token was rejected from this host — likely the IP claim embedded in it.',
+    bodyPreview: snapshot.bodyPreview,
+  });
 }

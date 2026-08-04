@@ -4,6 +4,7 @@ import { listProviders, updateProfile } from './controllers/automation.controlle
 import {
   authStatus,
   initLogin,
+  naukriProfile,
   probe,
   refresh,
   resendOtp,
@@ -60,6 +61,9 @@ app.get('/health', (_req, res) => {
  */
 app.post('/api/profile/update', asyncHandler(updateProfile));
 app.get('/api/providers', listProviders);
+
+// Read-only diagnostic: current keySkills/profileId, and proof the token works here.
+app.get('/api/naukri/profile', asyncHandler(naukriProfile));
 
 /*
  * Naukri auth. Interactive by necessity — an OTP needs a human — but the goal is to

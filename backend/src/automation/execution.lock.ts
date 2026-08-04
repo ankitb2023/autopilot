@@ -7,15 +7,15 @@ import type { ExecutionRequest, ProviderId, TriggerSource } from './types';
  * Execution mutual exclusion.
  *
  * Without this, a cron tick firing while the previous run is still going — or a
- * manual retry during a scheduled run — starts a second automation. From Phase 3
- * that means two Playwright browsers logging into the same account at once, which
+ * manual retry during a scheduled run — starts a second automation. This means
+ * two parallel API calls logging into the same account at once, which
  * is a plausible way to get the account flagged.
  *
  * A TTL lease row acquired with one atomic upsert. Not a Postgres advisory lock:
  * session-scoped advisory locks are bound to a connection and Prisma pools
  * connections, so the unlock can land on a different connection and silently leak.
  * The transaction-scoped variant avoids that only by holding a transaction open for
- * the entire run — minutes of `idle in transaction` once Playwright lands.
+ * the entire run — minutes of `idle in transaction` if an API call hangs.
  *
  * This gives us: atomicity, self-healing after a crash (TTL), correctness through
  * a connection pooler, and an inspectable holder (`SELECT * FROM automation_locks`).

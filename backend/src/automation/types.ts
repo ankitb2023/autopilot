@@ -33,8 +33,8 @@ export type TriggerSource = (typeof TRIGGER_SOURCES)[number];
  * The logger is passed in rather than imported so the service can pre-stamp it
  * with executionId and provider — that is the whole correlation story.
  *
- * `signal` is aborted when the time budget expires, so a hung Playwright session
- * (Phase 3) releases its browser instead of leaking it.
+ * `signal` is aborted when the time budget expires, so a hung API call
+ * releases its resources instead of hanging forever.
  */
 export interface ExecutionContext {
   readonly executionId: string;

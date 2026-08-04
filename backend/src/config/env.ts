@@ -23,7 +23,7 @@ const schema = z.object({
    */
   AUTOMATION_API_KEY: z.string().min(16).optional(),
 
-  /** Hard ceiling on one automation run. Raise in Phase 3 — Playwright is slower. */
+  /** Hard ceiling on one automation run. */
   EXECUTION_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
 
   /** 

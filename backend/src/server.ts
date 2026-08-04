@@ -106,9 +106,8 @@ server.keepAliveTimeout = 65_000;
 server.headersTimeout = 66_000;
 
 /**
- * Graceful shutdown. Render sends SIGTERM on every deploy, and from Phase 3 a
- * running automation owns a browser process — killing it mid-flight leaks Chromium
- * and (from Phase 4) leaves a history row stuck in RUNNING.
+ * Graceful shutdown. Render sends SIGTERM on every deploy, and killing a running
+ * automation mid-flight leaves a history row stuck in RUNNING.
  */
 let shuttingDown = false;
 

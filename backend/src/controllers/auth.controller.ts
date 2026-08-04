@@ -1,13 +1,22 @@
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 
-import { clearCookieJar, cookieNames, loadCookieJar } from '../automation/naukri/cookies';
+import {
+  clearCookieJar,
+  cookieNames,
+  loadCookieJar,
+  parseCookieHeader,
+  readAccessTokenCookie,
+  saveCookieJar,
+} from '../automation/naukri/cookies';
 import {
   attemptLogin,
   getAccessToken,
   readJwtExpiry,
   refreshCentralLogin,
+  resendMfaOtp,
   storeAccessToken,
+  verifyMfaOtp,
 } from '../automation/naukri/naukri.auth';
 import { logger } from '../config/logger';
 import { prisma } from '../config/prisma';
@@ -36,6 +45,8 @@ export async function initLogin(_req: Request, res: Response): Promise<void> {
       message: 'OTP sent to your registered email. Post it to /api/auth/verify-otp.',
       flowId: attempt.flowId,
       email: attempt.email,
+      // Echoed back so /api/auth/resend-otp can be called without another login.
+      userId: attempt.userId,
     });
     return;
   }
@@ -59,6 +70,8 @@ export async function initLogin(_req: Request, res: Response): Promise<void> {
 const verifyOtpSchema = z.object({
   otp: z.string().min(4).max(10),
   flowId: z.string().min(1),
+  /** Optional override; defaults to NAUKRI_EMAIL. */
+  username: z.string().min(1).optional(),
 });
 
 /**
@@ -68,9 +81,9 @@ const verifyOtpSchema = z.object({
  * possible, so the response reports which ones arrived.
  */
 export async function verifyOtp(req: Request, res: Response): Promise<void> {
-  const { otp, flowId } = verifyOtpSchema.parse(req.body);
+  const { otp, flowId, username } = verifyOtpSchema.parse(req.body);
 
-  const attempt = await attemptLogin(logger, { otp, flowId });
+  const attempt = await verifyMfaOtp(logger, { token: otp, flowId, ...(username ? { username } : {}) });
 
   if (attempt.accessToken) {
     const jar = await loadCookieJar();
@@ -87,10 +100,29 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
 
   res.status(400).json({
     status: 'VERIFY_FAILED',
-    message: attempt.mfaRequired
-      ? 'Naukri still wants an OTP — the code may be wrong or expired.'
-      : `Naukri returned HTTP ${attempt.status}.`,
+    message: `Naukri rejected the code (HTTP ${attempt.status}). If it expired, use POST /api/auth/resend-otp rather than logging in again — a fresh login consumes another send from the daily quota.`,
     naukriResponse: attempt.body,
+  });
+}
+
+const resendSchema = z.object({
+  flowId: z.string().min(1),
+  userId: z.string().min(1).optional(),
+  username: z.string().min(1).optional(),
+});
+
+/**
+ * POST /api/auth/resend-otp — body `{ flowId, userId? }`
+ *
+ * Requests a new code for an MFA challenge already in flight. Cheaper than repeating
+ * the login: Naukri enforces a daily send quota and a fresh login spends from it too.
+ */
+export async function resendOtp(req: Request, res: Response): Promise<void> {
+  const input = resendSchema.parse(req.body);
+  const result = await resendMfaOtp(logger, input);
+  res.status(result.status >= 400 ? 400 : 200).json({
+    status: result.status >= 400 ? 'RESEND_FAILED' : 'RESENT',
+    naukriResponse: result.body,
   });
 }
 
@@ -171,6 +203,52 @@ export async function storeToken(req: Request, res: Response): Promise<void> {
 export async function resetSession(_req: Request, res: Response): Promise<void> {
   await clearCookieJar();
   res.json({ status: 'CLEARED', message: 'Cookie jar dropped. Next login starts fresh.' });
+}
+
+const seedSessionSchema = z.object({
+  /** A raw `Cookie:` header copied from the browser, e.g. "nauk_at=…; _t_ds=…". */
+  cookie: z.string().min(10),
+});
+
+/**
+ * POST /api/auth/session — body `{ cookie }`
+ *
+ * Seeds the jar from a live browser session, bypassing the OTP flow completely: with
+ * real session cookies in hand the central-login refresh works immediately.
+ *
+ * Where to get it: DevTools → Network → any naukri.com request → Request Headers →
+ * copy the whole `Cookie:` value.
+ *
+ * Merges rather than replaces, so a partial paste cannot silently drop cookies the
+ * automation already had.
+ */
+export async function seedSession(req: Request, res: Response): Promise<void> {
+  const { cookie } = seedSessionSchema.parse(req.body);
+
+  const incoming = parseCookieHeader(cookie);
+  if (Object.keys(incoming).length === 0) {
+    throw new AppError('No cookies could be parsed from that value.', 400, 'NO_COOKIES_PARSED');
+  }
+
+  const merged = { ...(await loadCookieJar()), ...incoming };
+  await saveCookieJar(merged);
+
+  // If the paste included nauk_at it is already a usable bearer; register it so the
+  // very next run works even before a refresh happens.
+  const token = readAccessTokenCookie(merged);
+  if (token) {
+    const expiresAt = readJwtExpiry(token);
+    if (expiresAt.getTime() > Date.now()) {
+      await storeAccessToken(token, expiresAt, 'seeded');
+    }
+  }
+
+  res.json({
+    status: 'SEEDED',
+    cookiesHeld: cookieNames(merged),
+    accessTokenFound: token !== undefined,
+    nextStep: 'POST /api/auth/refresh — if it returns REFRESHED, unattended runs work.',
+  });
 }
 
 /** GET /api/auth/probe — resolves a usable token the way the worker does. */

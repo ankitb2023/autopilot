@@ -85,6 +85,27 @@ export function mergeSetCookies(jar: CookieJar, headers: Headers): CookieJar {
   return merged;
 }
 
+/**
+ * Parses a browser `Cookie:` header into a jar.
+ *
+ * Lets a live browser session be transplanted into the automation directly, which
+ * sidesteps the OTP flow entirely: with the real session cookies present, the
+ * central-login refresh can mint tokens straight away.
+ */
+export function parseCookieHeader(header: string): CookieJar {
+  const jar: CookieJar = {};
+
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq <= 0) continue;
+    const name = part.slice(0, eq).trim();
+    const value = part.slice(eq + 1).trim();
+    if (name && value) jar[name] = value;
+  }
+
+  return jar;
+}
+
 /** Names present in the jar — safe to log, unlike the values. */
 export function cookieNames(jar: CookieJar): string[] {
   return Object.keys(jar).sort();

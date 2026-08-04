@@ -32,7 +32,22 @@ import {
  * `NaukriReauthRequiredError` naming the exact endpoints to call.
  */
 
+/*
+ * Endpoints and header values taken verbatim from Naukri's own login-layer bundle
+ * (`LOGIN_API_URL_CENTRAL`, `MFA_OTP_LOGIN_URL`, `RESEND_MFA_OTP_URL`).
+ *
+ * The distinction below is not cosmetic: MFA verification is a *different endpoint*
+ * from login. Posting an OTP back to the login endpoint makes Naukri generate a new
+ * OTP instead of verifying the one you have, which burns the daily send quota and
+ * fails with `403009 Daily email/sms quota limit reached`.
+ */
 const LOGIN_URL = 'https://www.naukri.com/central-login-services/v1/login';
+const MFA_OTP_LOGIN_URL = 'https://www.naukri.com/central-login-services/v0/otp-login';
+const RESEND_MFA_OTP_URL = 'https://www.naukri.com/central-login-services/v0/resend-mfa-otp';
+
+/** Their `LoginSystemId` — the password login uses 'Naukri', OTP calls use 'jobseeker'. */
+const LOGIN_SYSTEM_ID = 'Naukri';
+const OTP_SYSTEM_ID = 'jobseeker';
 
 /**
  * The central-login refresh endpoint — `REFRESH_CENTRAL_LOGIN_URL` in Naukri's own
@@ -68,13 +83,13 @@ export class NaukriReauthRequiredError extends AppError {
   }
 }
 
-/** Headers Naukri's gateway expects. Sent on every call so behaviour is consistent. */
-function baseHeaders(): Record<string, string> {
+/** Headers Naukri's gateway expects, matching their login layer's request shape. */
+function baseHeaders(systemId: string): Record<string, string> {
   return {
     accept: 'application/json',
     'content-type': 'application/json',
     appid: '105',
-    systemid: 'jobseeker',
+    systemid: systemId,
     clientid: 'd3skt0p',
     'x-requested-with': 'XMLHttpRequest',
     'user-agent': USER_AGENT,
@@ -88,6 +103,10 @@ export interface LoginAttempt {
   mfaRequired: boolean;
   flowId?: string;
   email?: string;
+  /** Needed to resend the OTP; their resend call requires it alongside flowId. */
+  userId?: string;
+  /** The username Naukri echoes back — used verbatim when verifying. */
+  username?: string;
   accessToken?: string;
   expiresAt?: Date;
   status: number;
@@ -95,14 +114,12 @@ export interface LoginAttempt {
 }
 
 /**
- * Performs a login call, replaying the stored cookie jar and capturing whatever comes
- * back. `otp` + `flowId` turn this into the MFA verification step — the endpoint is
- * the same, which is why one function covers both.
+ * Password login. Never carries an OTP — MFA verification is a separate endpoint.
+ *
+ * A 403 `MFA required` is the expected outcome from an unrecognised device; it means
+ * Naukri has emailed a code and is waiting for `verifyMfaOtp`.
  */
-export async function attemptLogin(
-  logger: Logger,
-  credentials?: { otp: string; flowId: string },
-): Promise<LoginAttempt> {
+export async function attemptLogin(logger: Logger): Promise<LoginAttempt> {
   if (!env.NAUKRI_EMAIL || !env.NAUKRI_PASSWORD) {
     throw new NaukriReauthRequiredError('NAUKRI_EMAIL and NAUKRI_PASSWORD are not set.');
   }
@@ -110,28 +127,20 @@ export async function attemptLogin(
   const jar = await loadCookieJar();
   const cookieHeader = toCookieHeader(jar);
 
-  logger.info('naukri login attempt', {
-    withOtp: credentials !== undefined,
-    replayedCookies: Object.keys(jar).length,
-  });
+  logger.info('naukri password login attempt', { replayedCookies: Object.keys(jar).length });
 
   const response = await globalThis.fetch(LOGIN_URL, {
     method: 'POST',
     headers: {
-      ...baseHeaders(),
+      ...baseHeaders(LOGIN_SYSTEM_ID),
       ...(cookieHeader ? { cookie: cookieHeader } : {}),
     },
-    body: JSON.stringify({
-      username: env.NAUKRI_EMAIL,
-      password: env.NAUKRI_PASSWORD,
-      ...(credentials ? { otp: credentials.otp, flowId: credentials.flowId } : {}),
-    }),
+    body: JSON.stringify({ username: env.NAUKRI_EMAIL, password: env.NAUKRI_PASSWORD }),
   });
 
-  // Persist cookies from *every* attempt, including failures: an MFA challenge often
-  // sets the flow-tracking cookie that the verification step is expected to send back.
-  const updatedJar = mergeSetCookies(jar, response.headers);
-  await saveCookieJar(updatedJar);
+  // Persist cookies from every attempt, including the MFA challenge: it sets the
+  // device and bot-manager cookies that the verification step is expected to echo.
+  await saveCookieJar(mergeSetCookies(jar, response.headers));
 
   const body: unknown = await response.json().catch(() => ({}));
   const record = asRecord(body);
@@ -141,34 +150,128 @@ export async function attemptLogin(
     logger.warn('naukri demanded MFA', { flowId: data.flowId });
     return {
       mfaRequired: true,
-      flowId: typeof data.flowId === 'string' ? data.flowId : undefined,
-      email: typeof data.email === 'string' ? data.email : undefined,
+      flowId: str(data.flowId),
+      email: str(data.email),
+      userId: str(data.userId),
+      username: str(data.username) ?? env.NAUKRI_EMAIL,
       status: response.status,
       body,
     };
   }
 
-  if (!response.ok) {
-    return { mfaRequired: false, status: response.status, body };
+  if (!response.ok) return { mfaRequired: false, status: response.status, body };
+
+  return finishLogin(logger, record, response, 'password');
+}
+
+/**
+ * Verifies an MFA code.
+ *
+ * Mirrors their `mfaStepLogin`: POST to the dedicated otp-login endpoint with
+ * `{username, token, flowId}` and `SystemId: jobseeker`. The code goes in `token`, and
+ * no password is sent — this endpoint verifies, it does not authenticate.
+ */
+export async function verifyMfaOtp(
+  logger: Logger,
+  input: { token: string; flowId: string; username?: string },
+): Promise<LoginAttempt> {
+  const username = input.username ?? env.NAUKRI_EMAIL;
+  if (!username) {
+    throw new NaukriReauthRequiredError('NAUKRI_EMAIL is not set.');
   }
 
+  const jar = await loadCookieJar();
+  const cookieHeader = toCookieHeader(jar);
+
+  logger.info('verifying naukri mfa otp', {
+    flowId: input.flowId,
+    replayedCookies: Object.keys(jar).length,
+  });
+
+  const response = await globalThis.fetch(MFA_OTP_LOGIN_URL, {
+    method: 'POST',
+    headers: {
+      ...baseHeaders(OTP_SYSTEM_ID),
+      ...(cookieHeader ? { cookie: cookieHeader } : {}),
+    },
+    body: JSON.stringify({ username, token: input.token, flowId: input.flowId }),
+  });
+
+  await saveCookieJar(mergeSetCookies(jar, response.headers));
+
+  const body: unknown = await response.json().catch(() => ({}));
+  const record = asRecord(body);
+
+  if (!response.ok) {
+    logger.warn('mfa verification rejected', { status: response.status });
+    return { mfaRequired: true, flowId: input.flowId, status: response.status, body };
+  }
+
+  return finishLogin(logger, record, response, input.flowId);
+}
+
+/**
+ * Asks Naukri to send a new code for an in-flight MFA challenge.
+ *
+ * Exists so a mistyped or expired code doesn't force a fresh password login — which
+ * would consume another send from the daily quota on top of this one.
+ */
+export async function resendMfaOtp(
+  logger: Logger,
+  input: { flowId: string; userId?: string; username?: string },
+): Promise<{ status: number; body: unknown }> {
+  const username = input.username ?? env.NAUKRI_EMAIL;
+  const jar = await loadCookieJar();
+  const cookieHeader = toCookieHeader(jar);
+
+  const response = await globalThis.fetch(RESEND_MFA_OTP_URL, {
+    method: 'POST',
+    headers: {
+      ...baseHeaders(OTP_SYSTEM_ID),
+      ...(cookieHeader ? { cookie: cookieHeader } : {}),
+    },
+    body: JSON.stringify({ username, userId: input.userId, flowId: input.flowId }),
+  });
+
+  await saveCookieJar(mergeSetCookies(jar, response.headers));
+  const body: unknown = await response.json().catch(() => ({}));
+
+  logger.info('requested a new mfa otp', { status: response.status });
+  return { status: response.status, body };
+}
+
+/** Shared tail of both login paths: pull out the token, store it, report back. */
+async function finishLogin(
+  logger: Logger,
+  record: Record<string, unknown>,
+  response: Response,
+  obtainedVia: string,
+): Promise<LoginAttempt> {
   const token = extractAccessToken(record, response.headers);
+
   if (!token) {
     logger.error('naukri login succeeded but no token was found', {
       bodyKeys: Object.keys(record),
     });
-    return { mfaRequired: false, status: response.status, body };
+    return { mfaRequired: false, status: response.status, body: record };
   }
 
   const expiresAt = readJwtExpiry(token);
-  await storeAccessToken(token, expiresAt, credentials ? credentials.flowId : 'password');
+  await storeAccessToken(token, expiresAt, obtainedVia);
 
-  logger.info('naukri token obtained', {
-    expiresAt: expiresAt.toISOString(),
-    cookiesHeld: Object.keys(updatedJar).length,
-  });
+  logger.info('naukri token obtained', { via: obtainedVia, expiresAt: expiresAt.toISOString() });
 
-  return { mfaRequired: false, accessToken: token, expiresAt, status: response.status, body };
+  return {
+    mfaRequired: false,
+    accessToken: token,
+    expiresAt,
+    status: response.status,
+    body: record,
+  };
+}
+
+function str(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 /**

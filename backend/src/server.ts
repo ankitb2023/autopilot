@@ -6,7 +6,9 @@ import {
   initLogin,
   probe,
   refresh,
+  resendOtp,
   resetSession,
+  seedSession,
   storeToken,
   verifyOtp,
 } from './controllers/auth.controller';
@@ -65,18 +67,22 @@ app.get('/api/providers', listProviders);
  *
  *   POST /api/auth/init-login    password login; returns MFA_REQUIRED or a token
  *   POST /api/auth/verify-otp    { otp, flowId } — completes MFA, captures cookies
+ *   POST /api/auth/resend-otp    { flowId, userId? } — new code without a fresh login
  *   POST /api/auth/refresh       forces a silent re-login; THE test for unattended use
  *   GET  /api/auth/status        token validity + which cookies are held
  *   GET  /api/auth/probe         resolves a token exactly as the worker does
  *   POST /api/auth/store-token   manual paste-from-browser escape hatch
+ *   POST /api/auth/session       seed the jar from browser cookies — skips OTP entirely
  *   DELETE /api/auth/session     drop a stale cookie jar
  */
 app.post('/api/auth/init-login', asyncHandler(initLogin));
 app.post('/api/auth/verify-otp', asyncHandler(verifyOtp));
+app.post('/api/auth/resend-otp', asyncHandler(resendOtp));
 app.post('/api/auth/refresh', asyncHandler(refresh));
 app.get('/api/auth/status', asyncHandler(authStatus));
 app.get('/api/auth/probe', asyncHandler(probe));
 app.post('/api/auth/store-token', asyncHandler(storeToken));
+app.post('/api/auth/session', asyncHandler(seedSession));
 app.delete('/api/auth/session', asyncHandler(resetSession));
 
 app.use(notFoundHandler);

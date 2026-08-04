@@ -10,8 +10,9 @@ import { loadCookieJar, toCookieHeader } from './cookies';
  *
  * The URL is *not* the write endpoint: `v1/users/self/fullprofiles` answers GET with
  * 405. The path below is what their suggester plugin uses to read `keySkills`, with the
- * `AppId: 135` it sends. A second candidate follows as a fallback (`USER_PROFILE_API_URL`
- * in their browser config) since neither is documented as canonical.
+ * `AppId: 135` it sends; the response shape is `{ user, profile }` and the values live
+ * at `profile.keySkills` / `profile.profileId`. A second candidate follows as a fallback
+ * (`USER_PROFILE_API_URL` in their browser config).
  */
 
 interface ReadCandidate {
@@ -54,16 +55,18 @@ export async function fetchProfile(token: string, logger: Logger): Promise<Profi
   for (const candidate of READ_CANDIDATES) {
     const response = await globalThis.fetch(candidate.url, {
       method: 'GET',
+      /*
+       * Exactly the header set their suggester sends, and no more. Adding the ones the
+       * write path uses — x-requested-with, referer, user-agent — makes this endpoint
+       * return an empty HTTP 500. Verified against the live API: these five plus
+       * cookies give 200, the fuller set gives 500.
+       */
       headers: {
         accept: 'application/json',
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
         appid: candidate.appId,
         systemid: 'Naukri',
-        'x-requested-with': 'XMLHttpRequest',
-        referer: 'https://www.naukri.com/mnjuser/profile',
-        'user-agent':
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36',
         ...(cookieHeader ? { cookie: cookieHeader } : {}),
       },
     });

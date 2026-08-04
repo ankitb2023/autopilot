@@ -18,8 +18,15 @@ const SESSION_ID = 'default';
 
 export type CookieJar = Record<string, string>;
 
-/** Cookies that must never be persisted — they'd pin us to a stale login. */
-const NEVER_PERSIST = new Set(['nauk_at']);
+/**
+ * The cookie holding the access token.
+ *
+ * Naukri's own frontend reads the bearer token straight out of this cookie
+ * (`generateBearerToken` in their ajax.js), so we persist it like any other and mirror
+ * their behaviour. It is refreshed, not discarded: the central-login refresh endpoint
+ * replaces it via Set-Cookie.
+ */
+export const ACCESS_TOKEN_COOKIE = 'nauk_at';
 
 export async function loadCookieJar(): Promise<CookieJar> {
   const row = await prisma.naukriSession.findUnique({ where: { id: SESSION_ID } });
@@ -65,7 +72,7 @@ export function mergeSetCookies(jar: CookieJar, headers: Headers): CookieJar {
 
     const name = pair.slice(0, eq).trim();
     const value = pair.slice(eq + 1).trim();
-    if (!name || NEVER_PERSIST.has(name)) continue;
+    if (!name) continue;
 
     if (isExpired(attributes)) {
       delete merged[name];
@@ -81,6 +88,13 @@ export function mergeSetCookies(jar: CookieJar, headers: Headers): CookieJar {
 /** Names present in the jar — safe to log, unlike the values. */
 export function cookieNames(jar: CookieJar): string[] {
   return Object.keys(jar).sort();
+}
+
+/** The current access token, as the browser reads it: straight from the cookie. */
+export function readAccessTokenCookie(jar: CookieJar): string | undefined {
+  const value = jar[ACCESS_TOKEN_COOKIE];
+  // A logout sets an empty value; treat that as absent rather than as a token.
+  return value && value.length > 20 ? value : undefined;
 }
 
 function readSetCookies(headers: Headers): string[] {

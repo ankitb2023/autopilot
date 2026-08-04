@@ -2,7 +2,7 @@ import { env } from '../../config/env';
 import type { Logger } from '../../config/logger';
 import { AutomationFailedError } from '../../core/errors';
 import { loadCookieJar, mergeSetCookies, saveCookieJar, toCookieHeader } from '../naukri/cookies';
-import { getAccessToken, refreshAccessToken } from '../naukri/naukri.auth';
+import { getAccessToken, refreshCentralLogin } from '../naukri/naukri.auth';
 import type {
   AutomationAction,
   AutomationWorker,
@@ -53,16 +53,16 @@ export class NaukriWorker implements AutomationWorker {
     let response = await this.saveProfile(token, profileId, logger);
 
     /*
-     * 401 handling — the part that was missing before.
+     * 401 handling, mirroring Naukri's own frontend (`do401Handling` in their ajax.js):
+     * hit the central-login refresh endpoint, then replay the request exactly once.
      *
-     * A token can pass our expiry check and still be rejected: Naukri may revoke it
-     * early, or the clock skew is unlucky. One forced re-login and one retry is the
-     * right amount of persistence — beyond that we would be hammering a login
-     * endpoint with credentials, which is how accounts get locked.
+     * Their `isRefreshCentralLoginDone` flag guarantees a single retry, and we match
+     * that deliberately. Looping here would mean repeatedly presenting credentials to
+     * an auth endpoint, which is how accounts get locked.
      */
     if (response.status === 401) {
-      logger.warn('profile save rejected the token; forcing re-login and retrying once');
-      token = await refreshAccessToken(logger);
+      logger.warn('profile save returned 401; refreshing central login and retrying once');
+      token = await refreshCentralLogin(logger);
       signal.throwIfAborted();
       response = await this.saveProfile(token, profileId, logger);
     }

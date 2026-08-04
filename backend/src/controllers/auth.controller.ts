@@ -6,7 +6,7 @@ import {
   attemptLogin,
   getAccessToken,
   readJwtExpiry,
-  refreshAccessToken,
+  refreshCentralLogin,
   storeAccessToken,
 } from '../automation/naukri/naukri.auth';
 import { logger } from '../config/logger';
@@ -80,7 +80,7 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
       expiresAt: attempt.expiresAt?.toISOString(),
       cookiesCaptured: cookieNames(jar),
       nextStep:
-        'Call POST /api/auth/refresh to check whether a password-only re-login now works. If it does, the automation is fully unattended.',
+        'Call POST /api/auth/refresh to confirm the cookie-only refresh works. If it does, the automation is fully unattended from here on.',
     });
     return;
   }
@@ -97,15 +97,15 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
 /**
  * POST /api/auth/refresh
  *
- * Forces a silent re-login — the exact operation the scheduled run depends on. Run
- * this once after verifying an OTP: if it succeeds, unattended operation works. If it
- * returns 503, it does not, and no amount of scheduling will fix that.
+ * Forces the cookie-only refresh — the exact operation every scheduled run depends on,
+ * and the same call Naukri's frontend makes on a 401. If this succeeds, unattended
+ * operation works. A 503 means the stored session itself is dead and an OTP is needed.
  */
 export async function refresh(_req: Request, res: Response): Promise<void> {
-  const token = await refreshAccessToken(logger);
+  const token = await refreshCentralLogin(logger);
   res.json({
     status: 'REFRESHED',
-    message: 'Silent re-login succeeded — no OTP required. Unattended runs will work.',
+    message: 'Refreshed from session cookies — no password, no OTP. Unattended runs will work.',
     expiresAt: readJwtExpiry(token).toISOString(),
   });
 }
@@ -115,7 +115,8 @@ export async function authStatus(_req: Request, res: Response): Promise<void> {
   const [token, jar] = await Promise.all([
     prisma.naukriToken.findFirst({
       where: { expiresAt: { gt: new Date() } },
-      orderBy: { expiresAt: 'desc' },
+      // Matches getAccessToken's ordering, so status reports the token actually in use.
+      orderBy: { issuedAt: 'desc' },
       select: { issuedAt: true, expiresAt: true, flowId: true },
     }),
     loadCookieJar(),

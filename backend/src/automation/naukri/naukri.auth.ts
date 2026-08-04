@@ -2,7 +2,13 @@ import { env } from '../../config/env';
 import type { Logger } from '../../config/logger';
 import { prisma } from '../../config/prisma';
 import { AppError } from '../../core/errors';
-import { loadCookieJar, mergeSetCookies, saveCookieJar, toCookieHeader } from './cookies';
+import {
+  loadCookieJar,
+  mergeSetCookies,
+  readAccessTokenCookie,
+  saveCookieJar,
+  toCookieHeader,
+} from './cookies';
 
 /**
  * Naukri authentication.
@@ -11,24 +17,40 @@ import { loadCookieJar, mergeSetCookies, saveCookieJar, toCookieHeader } from '.
  * once a day — so at run time the token is always expired. Getting a new one must
  * therefore be automatic, and it must not require an OTP.
  *
- * The strategy is to behave like the browser does. A browser stays logged in for
- * weeks despite the same one-hour token, which means a non-OTP path to a fresh token
- * exists; the browser's advantage is simply that it keeps every cookie Naukri gives
- * it. So we keep them too (see cookies.ts) and replay them on re-login.
+ * The strategy is to do exactly what Naukri's own frontend does. Their `ajaxWrapper`
+ * reads the bearer token out of the `nauk_at` cookie, and on a 401 it GETs a
+ * central-login refresh endpoint, checks `loggedin`, and replays the request once. That
+ * endpoint needs neither password nor OTP — only the long-lived session cookies — which
+ * is how a browser stays usable for weeks on a one-hour token.
  *
- * Whether that is sufficient depends on how Naukri implements MFA:
- *   - if OTP verification marks the device trusted, replaying those cookies makes
- *     password-only re-login succeed, and this is fully unattended;
- *   - if it does not, `refreshAccessToken` throws `NaukriReauthRequiredError` with an
- *     actionable message rather than failing obscurely.
+ * So the ladder is:
+ *   1. a stored token that is still valid
+ *   2. `refreshCentralLogin` — cookies only, no credentials, the normal path
+ *   3. password login — last resort, and the only step that can trigger MFA
  *
- * Either way the failure is explicit and the manual escape hatch still works.
+ * Only when all three fail does a human need to supply an OTP, and that surfaces as
+ * `NaukriReauthRequiredError` naming the exact endpoints to call.
  */
 
 const LOGIN_URL = 'https://www.naukri.com/central-login-services/v1/login';
 
+/**
+ * The central-login refresh endpoint — `REFRESH_CENTRAL_LOGIN_URL` in Naukri's own
+ * frontend. This is the mechanism that keeps a browser logged in for weeks on a
+ * one-hour token, and it needs no OTP and no password.
+ *
+ * It looks useless from the outside: the body is only `{loggedin: true}`. The token
+ * arrives as a `Set-Cookie: nauk_at=…` side effect, which is why the response body
+ * appears empty of anything valuable. `loggedin` is exactly the field their frontend
+ * checks before retrying a 401'd request.
+ */
+const REFRESH_URL = 'https://www.naukri.com/central-login-services/v0/credentials/login-status';
+
 /** Don't hand out a token that expires mid-request. */
 const TOKEN_SAFETY_MARGIN_MS = 60_000;
+
+const USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36';
 
 /**
  * Naukri needs re-authentication with a human-supplied OTP.
@@ -55,8 +77,7 @@ function baseHeaders(): Record<string, string> {
     systemid: 'jobseeker',
     clientid: 'd3skt0p',
     'x-requested-with': 'XMLHttpRequest',
-    'user-agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+    'user-agent': USER_AGENT,
     origin: 'https://www.naukri.com',
     referer: 'https://www.naukri.com/nlogin/login',
   };
@@ -151,15 +172,83 @@ export async function attemptLogin(
 }
 
 /**
- * Returns a usable access token, logging in again if the stored one is gone or stale.
+ * Exchanges the long-lived session cookies for a fresh access token.
  *
- * This is the only function the worker should call. It never prompts, never blocks —
- * it either produces a token or throws something actionable.
+ * This is the unattended renewal path, copied from what Naukri's frontend does on a
+ * 401: GET the refresh endpoint with cookies attached, confirm `loggedin`, then read
+ * the new `nauk_at` out of Set-Cookie. No password, no OTP.
+ *
+ * `loggedin: false` means the underlying session itself is dead — that is the one case
+ * a human has to fix, and their frontend responds by redirecting to the login page.
+ */
+export async function refreshCentralLogin(logger: Logger): Promise<string> {
+  const jar = await loadCookieJar();
+  const cookieHeader = toCookieHeader(jar);
+
+  if (!cookieHeader) {
+    throw new NaukriReauthRequiredError('no session cookies are stored.');
+  }
+
+  const response = await globalThis.fetch(REFRESH_URL, {
+    method: 'GET',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      appid: '105',
+      // Their frontend overrides systemid to 'jobseeker' for exactly this call.
+      systemid: 'jobseeker',
+      'x-requested-with': 'XMLHttpRequest',
+      'cache-control': 'no-cache, no-store, must-revalidate',
+      'user-agent': USER_AGENT,
+      referer: 'https://www.naukri.com/mnjuser/profile',
+      cookie: cookieHeader,
+    },
+  });
+
+  const updatedJar = mergeSetCookies(jar, response.headers);
+  await saveCookieJar(updatedJar);
+
+  const body = asRecord(await response.json().catch(() => ({})));
+
+  if (!response.ok) {
+    throw new NaukriReauthRequiredError(`refresh endpoint returned HTTP ${response.status}.`);
+  }
+
+  if (body.loggedin !== true) {
+    throw new NaukriReauthRequiredError('the stored session is no longer logged in.');
+  }
+
+  const token = readAccessTokenCookie(updatedJar);
+  if (!token) {
+    throw new NaukriReauthRequiredError(
+      'refresh reported loggedin but returned no nauk_at cookie.',
+    );
+  }
+
+  const expiresAt = readJwtExpiry(token);
+  await storeAccessToken(token, expiresAt, 'central-login-refresh');
+
+  logger.info('refreshed naukri token via central login', {
+    expiresAt: expiresAt.toISOString(),
+  });
+
+  return token;
+}
+
+/**
+ * Returns a usable access token.
+ *
+ * The only function the worker should call. Order of preference mirrors cost: a stored
+ * token, then a cookie-only refresh, and password login solely as a last resort — that
+ * one can trigger MFA, so it is not something to attempt casually on a schedule.
  */
 export async function getAccessToken(logger: Logger): Promise<string> {
   const stored = await prisma.naukriToken.findFirst({
     where: { expiresAt: { gt: new Date(Date.now() + TOKEN_SAFETY_MARGIN_MS) } },
-    orderBy: { expiresAt: 'desc' },
+    // Newest first, not longest-lived first: a refresh issues a token with the same
+    // one-hour lifetime as the one it replaces, so ordering by expiry can tie and hand
+    // back the token we just superseded.
+    orderBy: { issuedAt: 'desc' },
   });
 
   if (stored) {
@@ -169,8 +258,18 @@ export async function getAccessToken(logger: Logger): Promise<string> {
     return stored.accessToken;
   }
 
-  logger.info('no usable token; attempting silent re-login');
-  return refreshAccessToken(logger);
+  logger.info('no usable token; refreshing via central login');
+
+  try {
+    return await refreshCentralLogin(logger);
+  } catch (error) {
+    if (!(error instanceof NaukriReauthRequiredError)) throw error;
+
+    logger.warn('cookie refresh failed; falling back to password login', {
+      reason: error.message,
+    });
+    return refreshAccessToken(logger);
+  }
 }
 
 /**

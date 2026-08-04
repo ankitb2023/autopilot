@@ -45,8 +45,16 @@ const LOGIN_URL = 'https://www.naukri.com/central-login-services/v1/login';
 const MFA_OTP_LOGIN_URL = 'https://www.naukri.com/central-login-services/v0/otp-login';
 const RESEND_MFA_OTP_URL = 'https://www.naukri.com/central-login-services/v0/resend-mfa-otp';
 
-/** Their `LoginSystemId` — the password login uses 'Naukri', OTP calls use 'jobseeker'. */
-const LOGIN_SYSTEM_ID = 'Naukri';
+/*
+ * Both calls use 'jobseeker', established by testing against the live API.
+ *
+ * Their login-layer bundle declares `LoginSystemId: "Naukri"` alongside
+ * `OTPSystemId: "jobseeker"`, and switching the password login to 'Naukri' looked
+ * correct — but the live endpoint then returned an empty HTTP 400 instead of the
+ * expected `403 MFA required`. That pairing evidently belongs to a different AppId
+ * than the 105 we send. Do not "fix" this back without re-testing.
+ */
+const LOGIN_SYSTEM_ID = 'jobseeker';
 const OTP_SYSTEM_ID = 'jobseeker';
 
 /**

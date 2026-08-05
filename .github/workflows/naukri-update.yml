@@ -2,36 +2,74 @@ name: Naukri Profile Update
 
 on:
   schedule:
-    # 7:00 AM IST = 1:30 AM UTC
-    - cron: '30 1 * * *'
-    # 7:00 PM IST = 1:30 PM UTC
-    - cron: '30 13 * * *'
-  workflow_dispatch: # Allow manual trigger from GitHub UI
+    # Times are UTC. IST is UTC+5:30.
+    #   02:00 UTC = 07:30 IST
+    - cron: '0 2 * * *'
+    #   08:00 UTC = 13:30 IST
+    - cron: '0 8 * * *'
+  workflow_dispatch: # Manual trigger from the Actions tab
+
+# A run already in flight makes a second one pointless — the backend's execution
+# lock would reject it with 409 anyway.
+concurrency:
+  group: naukri-profile-update
+  cancel-in-progress: false
 
 jobs:
   update-profile:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
 
     steps:
       - name: Trigger Naukri profile update
+        env:
+          BACKEND_URL: ${{ secrets.AUTOPILOT_BACKEND_URL }}
         run: |
-          echo "=== Triggering Naukri profile update ==="
-          
-          response=$(curl -s -w "\n%{http_code}" -X POST \
-            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/profile/update" \
-            -H "Content-Type: application/json" \
-            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}')
-          
-          http_code=$(echo "$response" | tail -1)
-          body=$(echo "$response" | head -n -1)
-          
-          echo "HTTP Status: $http_code"
-          echo "Response: $body"
-          
-          if [ "$http_code" -ge 400 ]; then
-            echo "::error::Profile update failed with HTTP $http_code"
+          set -uo pipefail
+
+          if [ -z "${BACKEND_URL}" ]; then
+            echo "::error::AUTOPILOT_BACKEND_URL secret is not set"
             exit 1
           fi
-          
-          echo "✅ Profile update completed successfully"
+
+          # Render's free tier sleeps; wake it before the real call so the first
+          # request doesn't die on a cold start.
+          echo "Waking backend..."
+          curl -s -m 90 -o /dev/null "${BACKEND_URL}/health" || true
+
+          echo "Triggering profile update..."
+          response=$(curl -s -m 180 -w '\n%{http_code}' -X POST \
+            "${BACKEND_URL}/api/profile/update" \
+            -H 'content-type: application/json' \
+            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}')
+
+          http_code=$(printf '%s' "$response" | tail -n1)
+          body=$(printf '%s' "$response" | sed '$d')
+
+          echo "HTTP $http_code"
+          echo "$body"
+
+          # 409 = another run holds the execution lock. Expected, not a failure:
+          # the work is already being done, and there is nothing to retry.
+          if [ "$http_code" = "409" ]; then
+            echo "::notice::A run is already in progress; skipping this tick."
+            exit 0
+          fi
+
+          if [ "$http_code" -ge 400 ]; then
+            echo "::error::Backend returned HTTP $http_code"
+            exit 1
+          fi
+
+          # The important check. A 200 only means the *request* was handled —
+          # the automation's own outcome lives in the body's `status` field, so a
+          # rejected write arrives as HTTP 200 with status FAILED. Without this,
+          # a broken automation reports success indefinitely.
+          status=$(printf '%s' "$body" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -n1)
+
+          if [ "$status" != "SUCCESS" ]; then
+            echo "::error::Automation reported status='${status:-unknown}' — profile was NOT updated"
+            exit 1
+          fi
+
+          echo "Profile updated successfully."

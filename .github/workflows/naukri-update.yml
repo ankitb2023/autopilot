@@ -1,31 +1,79 @@
-name: Naukri Profile Update
+name: Naukri Automation
 
 on:
   schedule:
-    # 7:00 AM IST = 1:30 AM UTC
-    - cron: '30 1 * * *'
-    # 7:00 PM IST = 1:30 PM UTC
-    - cron: '30 13 * * *'
-  workflow_dispatch: # Allow manual trigger from GitHub UI
+    # Keep session alive every 2 hours (prevents Naukri session expiry)
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'What to do'
+        required: true
+        default: 'update'
+        type: choice
+        options:
+          - update
+          - refresh-only
 
 jobs:
-  update-profile:
+  naukri:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
     steps:
-      - name: Trigger Naukri profile update
+      - name: Wake up Render server
         run: |
-          echo "=== Triggering Naukri profile update ==="
-          
+          echo "Pinging server to wake it up..."
+          curl -s --max-time 120 "${{ secrets.AUTOPILOT_BACKEND_URL }}/health" || true
+          sleep 5
+
+      - name: Refresh Naukri session
+        id: refresh
+        run: |
+          echo "=== Refreshing Naukri session ==="
           response=$(curl -s -w "\n%{http_code}" -X POST \
-            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/profile/update" \
+            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/auth/refresh" \
             -H "Content-Type: application/json" \
-            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}')
+            --max-time 30)
           
           http_code=$(echo "$response" | tail -1)
           body=$(echo "$response" | head -n -1)
+          echo "Refresh: HTTP $http_code"
+          echo "Response: $body"
           
+          if [ "$http_code" -lt 400 ]; then
+            echo "refresh_ok=true" >> $GITHUB_OUTPUT
+          else
+            echo "refresh_ok=false" >> $GITHUB_OUTPUT
+            echo "::warning::Session refresh failed (HTTP $http_code). Session may need re-seeding."
+          fi
+
+      - name: Update Naukri profile
+        if: |
+          steps.refresh.outputs.refresh_ok == 'true' && (
+            github.event.schedule == '0 1 * * *' ||
+            github.event.schedule == '0 13 * * *' ||
+            github.event_name == 'workflow_dispatch'
+          )
+        run: |
+          # Only update profile at 7 AM IST (1 UTC) and 7 PM IST (13 UTC), or manual trigger
+          # Other hours just refresh the session to keep it alive
+          
+          ACTION="${{ github.event.inputs.action || 'update' }}"
+          if [ "$ACTION" = "refresh-only" ]; then
+            echo "Refresh-only mode — skipping profile update."
+            exit 0
+          fi
+          
+          echo "=== Updating Naukri profile ==="
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/profile/update" \
+            -H "Content-Type: application/json" \
+            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}' \
+            --max-time 60)
+          
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | head -n -1)
           echo "HTTP Status: $http_code"
           echo "Response: $body"
           
@@ -34,4 +82,4 @@ jobs:
             exit 1
           fi
           
-          echo "✅ Profile update completed successfully"
+          echo "✅ Profile updated successfully"

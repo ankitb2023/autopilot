@@ -62,6 +62,19 @@ jobs:
           # Free-tier instances sleep; the first request pays the cold start.
           curl -s -m 120 -o /dev/null "${BACKEND_URL}/health" || true
 
+      # Naukri binds a session to the IP that created it. Logging the outbound IP on
+      # every run turns this workflow's history into an IP log: if the session dies and
+      # the IP changed at the same time, IP drift is the cause and this host needs a
+      # single static outbound address.
+      - name: Record outbound IP
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          ip=$(curl -s -m 30 "${BACKEND_URL}/api/diag/egress" \
+            | sed -n 's/.*"egressIp":"\([^"]*\)".*/\1/p')
+          echo "outbound IP: ${ip:-unknown}"
+          echo "::notice::Outbound IP ${ip:-unknown}"
+
       - name: Refresh the Naukri session
         run: |
           set -uo pipefail

@@ -13,6 +13,7 @@ import {
   storeToken,
   verifyOtp,
 } from './controllers/auth.controller';
+import { egressIp } from './controllers/diag.controller';
 import { getSupportedProviders } from './automation/provider.registry';
 import { env } from './config/env';
 import { logger } from './config/logger';
@@ -64,6 +65,10 @@ app.get('/api/providers', listProviders);
 
 // Read-only diagnostic: current keySkills/profileId, and proof the token works here.
 app.get('/api/naukri/profile', asyncHandler(naukriProfile));
+
+// Reports this host's outbound IP. Naukri binds sessions to the creating IP, so IP
+// drift is the prime suspect for sessions dying and needing a manual OTP again.
+app.get('/api/diag/egress', asyncHandler(egressIp));
 
 /*
  * Naukri auth. Interactive by necessity — an OTP needs a human — but the goal is to

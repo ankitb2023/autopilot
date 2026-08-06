@@ -1,0 +1,67 @@
+name: Naukri Session Keep-Alive
+
+# Why this exists
+#
+# Two things expire, with very different consequences:
+#
+#   - the access token (nauk_at) lasts ~24h and renews itself silently
+#   - the session (nauk_rt) lasts ~9 days and, when it dies, can only be replaced
+#     by a fresh login — which Naukri always answers with an OTP
+#
+# A logged-in browser never sees that OTP because it keeps its session warm simply
+# by being used. This does the same thing: it exercises the session every 6 hours,
+# which should keep it alive for as long as a browser's would.
+#
+# It also acts as an early-warning system. If the session does die, this goes red
+# hours before the profile update would have failed, so the fix happens before a
+# scheduled run is missed rather than after.
+
+on:
+  schedule:
+    # Every 6 hours: 00:00, 06:00, 12:00, 18:00 UTC = 05:30, 11:30, 17:30, 23:30 IST.
+    # Deliberately offset from the update runs (02:00 / 08:00 UTC) so the two never
+    # contend for the execution lock.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: naukri-keepalive
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Refresh the Naukri session
+        env:
+          BACKEND_URL: ${{ secrets.AUTOPILOT_BACKEND_URL }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${BACKEND_URL}" ]; then
+            echo "::error::AUTOPILOT_BACKEND_URL secret is not set"
+            exit 1
+          fi
+
+          # Render's free tier sleeps; wake it so the real call isn't spent on a cold start.
+          curl -s -m 90 -o /dev/null "${BACKEND_URL}/health" || true
+
+          response=$(curl -s -m 120 -w '\n%{http_code}' -X POST "${BACKEND_URL}/api/auth/refresh")
+          http_code=$(printf '%s' "$response" | tail -n1)
+          body=$(printf '%s' "$response" | sed '$d')
+
+          echo "HTTP $http_code"
+          echo "$body"
+
+          if [ "$http_code" = "200" ]; then
+            echo "Session is alive and the token was renewed."
+            exit 0
+          fi
+
+          # 503 NAUKRI_REAUTH_REQUIRED means the session itself is gone. Nothing
+          # automated can recover from that — Naukri requires an OTP for a new
+          # session — so fail loudly to trigger the notification email.
+          echo "::error::Session is dead (HTTP $http_code). Re-seed cookies via POST /api/auth/session, or run init-login + verify-otp."
+          exit 1

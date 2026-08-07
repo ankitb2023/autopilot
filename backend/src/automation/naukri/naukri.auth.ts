@@ -1,7 +1,7 @@
 import { env } from '../../config/env';
 import type { Logger } from '../../config/logger';
 import { prisma } from '../../config/prisma';
-import { AppError } from '../../core/errors';
+import { AppError, toError } from '../../core/errors';
 import {
   loadCookieJar,
   mergeSetCookies,
@@ -293,6 +293,51 @@ function str(value: unknown): string | undefined {
  * a human has to fix, and their frontend responds by redirecting to the login page.
  */
 export async function refreshCentralLogin(logger: Logger): Promise<string> {
+  /*
+   * Retried, because this call fails transiently.
+   *
+   * Observed live: a 403 immediately after a cold start, then three consecutive
+   * successes seconds later with nothing changed. Naukri sits behind Akamai, which
+   * intermittently challenges a request that is otherwise perfectly valid.
+   *
+   * Without a retry a single blip is indistinguishable from a dead session, which
+   * would fail the scheduled run and — worse — tell the user to go through an OTP
+   * that was never actually needed.
+   */
+  const MAX_ATTEMPTS = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await attemptCentralLoginRefresh(logger);
+    } catch (error) {
+      lastError = error;
+
+      // A definitively logged-out session will not recover by retrying.
+      if (error instanceof NaukriReauthRequiredError && /no longer logged in/.test(error.message)) {
+        throw error;
+      }
+
+      if (attempt < MAX_ATTEMPTS) {
+        logger.warn('central login refresh failed; retrying', {
+          attempt,
+          reason: toError(error).message,
+        });
+        await delay(attempt * 3000);
+      }
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new NaukriReauthRequiredError('refresh failed repeatedly.');
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function attemptCentralLoginRefresh(logger: Logger): Promise<string> {
   const jar = await loadCookieJar();
   const cookieHeader = toCookieHeader(jar);
 

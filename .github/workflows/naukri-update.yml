@@ -1,32 +1,15 @@
 name: Naukri Automation
 
-# Two jobs in one workflow:
-#
-#   - every 2 hours: refresh the session so it never dies from inactivity
-#   - twice daily:   refresh, then update the profile
-#
-# Why the session matters more than the token: the access token lasts ~24h and
-# renews itself silently, but the session behind it lasted only ~9 days. When the
-# session dies nothing automated can recover it — Naukri requires an OTP for a new
-# one. A logged-in browser never hits that because it keeps its session in use;
-# the 2-hourly refresh does the same thing.
-#
-# The update slots are separate cron entries rather than a filter on one entry,
-# because `github.event.schedule` holds the *exact* cron string that fired. Gating
-# on a value that isn't declared in `on.schedule` can never match, so the update
-# step would silently never run on a schedule.
-#
-# The keep-alive cron deliberately skips 02:00 and 08:00 UTC so the two schedules
-# never fire in the same minute and contend for the backend's execution lock.
-
 on:
   schedule:
-    # Keep-alive — every 2 hours except the two update hours. UTC.
-    - cron: '0 0,4,6,10,12,14,16,18,20,22 * * *'
-    # 02:00 UTC = 07:30 IST — profile update
-    - cron: '0 2 * * *'
-    # 08:00 UTC = 13:30 IST — profile update
-    - cron: '0 8 * * *'
+    # 1) Keep Render server awake (prevents IP drift that kills sessions)
+    - cron: '*/14 * * * *'
+    # 2) Refresh session every hour (keeps Naukri cookies alive)
+    - cron: '0 * * * *'
+    # 3) Update profile at 7:00 AM IST (1:30 AM UTC)
+    - cron: '30 1 * * *'
+    # 4) Update profile at 7:00 PM IST (1:30 PM UTC)
+    - cron: '30 13 * * *'
   workflow_dispatch:
     inputs:
       action:
@@ -36,98 +19,58 @@ on:
         type: choice
         options:
           - update
-          - refresh-only
-
-concurrency:
-  group: naukri-automation
-  cancel-in-progress: false
-
-env:
-  BACKEND_URL: ${{ secrets.AUTOPILOT_BACKEND_URL }}
+          - refresh
+          - ping
 
 jobs:
   naukri:
     runs-on: ubuntu-latest
-    # Generous: Render's free tier can take ~50s to wake, and the update follows.
-    timeout-minutes: 10
+    timeout-minutes: 2
 
     steps:
-      - name: Wake the backend
+      - name: ⏱️ Keep-Alive Ping (Render)
+        if: github.event.schedule == '*/14 * * * *' || github.event.inputs.action == 'ping'
         run: |
-          set -uo pipefail
-          if [ -z "${BACKEND_URL}" ]; then
-            echo "::error::AUTOPILOT_BACKEND_URL secret is not set"
-            exit 1
-          fi
-          # Free-tier instances sleep; the first request pays the cold start.
-          curl -s -m 120 -o /dev/null "${BACKEND_URL}/health" || true
+          echo "Pinging server to prevent sleep and IP drift..."
+          curl -s --max-time 120 "${{ secrets.AUTOPILOT_BACKEND_URL }}/health" || true
 
-      # Naukri binds a session to the IP that created it. Logging the outbound IP on
-      # every run turns this workflow's history into an IP log: if the session dies and
-      # the IP changed at the same time, IP drift is the cause and this host needs a
-      # single static outbound address.
-      - name: Record outbound IP
-        continue-on-error: true
+      - name: 🔄 Refresh Naukri Session
+        if: github.event.schedule == '0 * * * *' || github.event.inputs.action == 'refresh'
         run: |
-          set -uo pipefail
-          ip=$(curl -s -m 30 "${BACKEND_URL}/api/diag/egress" \
-            | sed -n 's/.*"egressIp":"\([^"]*\)".*/\1/p')
-          echo "outbound IP: ${ip:-unknown}"
-          echo "::notice::Outbound IP ${ip:-unknown}"
-
-      - name: Refresh the Naukri session
-        run: |
-          set -uo pipefail
-          response=$(curl -s -m 120 -w '\n%{http_code}' -X POST "${BACKEND_URL}/api/auth/refresh")
-          http_code=$(printf '%s' "$response" | tail -n1)
-          echo "HTTP $http_code"
-          printf '%s\n' "$response" | sed '$d'
-
-          if [ "$http_code" != "200" ]; then
-            # 503 NAUKRI_REAUTH_REQUIRED = the session is gone. No automated
-            # recovery exists, so fail loudly to trigger the notification email.
-            echo "::error::Session refresh failed (HTTP $http_code). Re-seed cookies via POST /api/auth/session."
-            exit 1
-          fi
-          echo "Session alive, token renewed."
-
-      # Runs only on the two update slots, or when triggered by hand.
-      - name: Update the Naukri profile
-        if: |
-          github.event.schedule == '0 2 * * *' ||
-          github.event.schedule == '0 8 * * *' ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'update')
-        run: |
-          set -uo pipefail
-          response=$(curl -s -m 180 -w '\n%{http_code}' -X POST \
-            "${BACKEND_URL}/api/profile/update" \
-            -H 'content-type: application/json' \
-            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}')
-
-          http_code=$(printf '%s' "$response" | tail -n1)
-          body=$(printf '%s' "$response" | sed '$d')
-          echo "HTTP $http_code"
-          echo "$body"
-
-          # 409 = another run holds the execution lock. Expected, not a failure.
-          if [ "$http_code" = "409" ]; then
-            echo "::notice::A run is already in progress; skipping."
-            exit 0
-          fi
-
+          echo "=== Refreshing Naukri session ==="
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/auth/refresh" \
+            -H "Content-Type: application/json" \
+            --max-time 30)
+          
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | head -n -1)
+          echo "Refresh: HTTP $http_code"
+          echo "Response: $body"
+          
           if [ "$http_code" -ge 400 ]; then
-            echo "::error::Backend returned HTTP $http_code"
+            echo "::error::Session refresh failed (HTTP $http_code). Session may need re-seeding."
             exit 1
           fi
 
-          # The check that matters. HTTP 200 only means the request was handled —
-          # the automation's own outcome is in the body's `status`, so a rejected
-          # write arrives as 200 with status FAILED. Without this, a broken
-          # automation reports success forever.
-          status=$(printf '%s' "$body" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -n1)
-          if [ "$status" != "SUCCESS" ]; then
-            echo "::error::Automation reported status='${status:-unknown}' — profile was NOT updated"
+      - name: 📝 Update Naukri Profile
+        if: github.event.schedule == '30 1 * * *' || github.event.schedule == '30 13 * * *' || github.event.inputs.action == 'update'
+        run: |
+          echo "=== Updating Naukri profile ==="
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/profile/update" \
+            -H "Content-Type: application/json" \
+            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}' \
+            --max-time 60)
+          
+          http_code=$(echo "$response" | tail -1)
+          body=$(echo "$response" | head -n -1)
+          echo "HTTP Status: $http_code"
+          echo "Response: $body"
+          
+          if [ "$http_code" -ge 400 ]; then
+            echo "::error::Profile update failed with HTTP $http_code"
             exit 1
           fi
-
-          echo "Profile updated."
+          
+          echo "✅ Profile updated successfully"

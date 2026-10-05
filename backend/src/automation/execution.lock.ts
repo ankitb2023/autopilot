@@ -1,7 +1,7 @@
 import { logger } from '../config/logger';
 import { prisma } from '../config/prisma';
 import { ServiceUnavailableError, toError } from '../core/errors';
-import type { ExecutionRequest, ProviderId, TriggerSource } from './types';
+import type { ExecutionRequest, TriggerSource } from './types';
 
 /**
  * Execution mutual exclusion.
@@ -29,15 +29,15 @@ import type { ExecutionRequest, ProviderId, TriggerSource } from './types';
 const LOCK_GRACE_MS = 30_000;
 
 /**
- * Lock key: **provider only**, deliberately ignoring the action.
+ * Lock key: **provider + account**, deliberately ignoring the action.
  *
- * The contended resource is the remote account/session, and that is per-provider.
- * Keying on `provider:action` would still let `naukri:profile.update` and a future
- * `naukri:resume.upload` drive two simultaneous logins into the same account —
- * exactly what this prevents. One function, one place to change.
+ * The contended resource is the remote account/session. Keying on `provider:action`
+ * would still let `naukri:profile.update` and a future `naukri:resume.upload` drive
+ * two simultaneous logins into the same account — exactly what this prevents. Two
+ * different accounts share nothing, so they never block each other.
  */
-export function buildLockKey(request: Pick<ExecutionRequest, 'provider'>): ProviderId {
-  return request.provider;
+export function buildLockKey(request: Pick<ExecutionRequest, 'provider' | 'account'>): string {
+  return `${request.provider}:${request.account}`;
 }
 
 export type LockAcquisition =

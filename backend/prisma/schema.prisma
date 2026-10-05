@@ -62,14 +62,15 @@ model ExecutionHistory {
   @@map("execution_history")
 }
 
-/// Mutual-exclusion lease for automation runs — one row per lock key (per provider).
+/// Mutual-exclusion lease for automation runs — one row per lock key (per provider
+/// account).
 /// A concurrent run for the same key is rejected with 409 rather than driving a
 /// second browser session into the same account.
 ///
 /// See src/automation/execution.lock.ts for why this is a lease row rather than a
 /// Postgres advisory lock.
 model AutomationLock {
-  /// Lock key, e.g. "naukri". Natural primary key: one row per lock by definition.
+  /// Lock key, e.g. "naukri:default". Natural primary key: one row per lock by definition.
   key String @id
 
   /// The run holding the lease. Release only deletes its own row, so a run whose
@@ -92,7 +93,7 @@ model AutomationLock {
   @@map("automation_locks")
 }
 
-/// The Naukri cookie jar — a single row, persisted across restarts and deploys.
+/// The Naukri cookie jar — one row per account, persisted across restarts and deploys.
 ///
 /// This is the load-bearing piece for unattended operation. `fetch` has no cookie
 /// jar, so without this every request looks like a brand-new unrecognised device to
@@ -104,7 +105,8 @@ model AutomationLock {
 /// strings: we only ever need to echo them back, and attributes like Path/Domain are
 /// irrelevant when we talk to exactly one host.
 model NaukriSession {
-  /// Fixed key — AutoPilot is single-account, so there is exactly one session row.
+  /// The account key, e.g. "default". One row per Naukri account; the set of rows is
+  /// the set of accounts the scheduled runs cover.
   id String @id @default("default")
 
   /// `{ cookieName: value }`.
@@ -119,7 +121,10 @@ model NaukriSession {
 /// The worker reads the latest valid token before each run.
 model NaukriToken {
   id        String   @id @default(uuid()) @db.Uuid
-  
+
+  /// Which account this token belongs to — matches NaukriSession.id.
+  accountId String   @default("default")
+
   /// The JWT access token
   accessToken String @db.Text
   
@@ -132,6 +137,6 @@ model NaukriToken {
   /// MFA flow ID used to obtain this token (for audit)
   flowId    String?
 
-  @@index([expiresAt(sort: Desc)])
+  @@index([accountId, expiresAt(sort: Desc)])
   @@map("naukri_tokens")
 }

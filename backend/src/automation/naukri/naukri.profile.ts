@@ -47,8 +47,12 @@ export interface ProfileSnapshot {
   bodyPreview: string;
 }
 
-export async function fetchProfile(token: string, logger: Logger): Promise<ProfileSnapshot> {
-  const jar = await loadCookieJar();
+export async function fetchProfile(
+  token: string,
+  account: string,
+  logger: Logger,
+): Promise<ProfileSnapshot> {
+  const jar = await loadCookieJar(account);
   const cookieHeader = toCookieHeader(jar);
   const attempts: ProfileAttempt[] = [];
 

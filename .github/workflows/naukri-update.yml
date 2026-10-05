@@ -25,7 +25,8 @@ on:
 jobs:
   naukri:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # Accounts run one after another; each refresh can take ~10s with retries.
+    timeout-minutes: 5
 
     steps:
       - name: ⏱️ Keep-Alive Ping (Render)
@@ -34,43 +35,72 @@ jobs:
           echo "Pinging server to prevent sleep and IP drift..."
           curl -s --max-time 120 "${{ secrets.AUTOPILOT_BACKEND_URL }}/health" || true
 
-      - name: 🔄 Refresh Naukri Session
+      # Every account with a stored session is covered — seeding cookies for a new
+      # account id is all it takes to add one. One account failing does not stop the
+      # others; the job fails at the end if any did.
+      - name: 🔄 Refresh Naukri Sessions
         if: github.event.schedule == '0 * * * *' || github.event.inputs.action == 'refresh'
+        env:
+          BASE_URL: ${{ secrets.AUTOPILOT_BACKEND_URL }}
         run: |
-          echo "=== Refreshing Naukri session ==="
-          response=$(curl -s -w "\n%{http_code}" -X POST \
-            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/auth/refresh" \
-            -H "Content-Type: application/json" \
-            --max-time 30)
-          
-          http_code=$(echo "$response" | tail -1)
-          body=$(echo "$response" | head -n -1)
-          echo "Refresh: HTTP $http_code"
-          echo "Response: $body"
-          
-          if [ "$http_code" -ge 400 ]; then
-            echo "::error::Session refresh failed (HTTP $http_code). Session may need re-seeding."
+          accounts=$(curl -sf --max-time 90 "$BASE_URL/api/auth/accounts" | jq -r '.accounts[]' || true)
+          if [ -z "$accounts" ]; then
+            echo "::error::Could not list accounts (backend down, or no session seeded)."
             exit 1
           fi
 
-      - name: 📝 Update Naukri Profile
+          failed=0
+          for account in $accounts; do
+            echo "=== Refreshing Naukri session: $account ==="
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+              "$BASE_URL/api/auth/refresh?account=$account" \
+              -H "Content-Type: application/json" \
+              --max-time 30 || true)
+
+            http_code=$(echo "$response" | tail -1)
+            body=$(echo "$response" | head -n -1)
+            echo "Refresh: HTTP $http_code"
+            echo "Response: $body"
+
+            # 000 = no response at all (timeout / connection refused).
+            if [ "$http_code" = "000" ] || [ "$http_code" -ge 400 ]; then
+              echo "::error::Session refresh failed for $account (HTTP $http_code). Session may need re-seeding."
+              failed=1
+            fi
+          done
+          exit $failed
+
+      - name: 📝 Update Naukri Profiles
         if: github.event.schedule == '30 1 * * *' || github.event.schedule == '30 13 * * *' || github.event.inputs.action == 'update'
+        env:
+          BASE_URL: ${{ secrets.AUTOPILOT_BACKEND_URL }}
         run: |
-          echo "=== Updating Naukri profile ==="
-          response=$(curl -s -w "\n%{http_code}" -X POST \
-            "${{ secrets.AUTOPILOT_BACKEND_URL }}/api/profile/update" \
-            -H "Content-Type: application/json" \
-            -d '{"provider":"naukri","trigger":"CRON","dryRun":false}' \
-            --max-time 60)
-          
-          http_code=$(echo "$response" | tail -1)
-          body=$(echo "$response" | head -n -1)
-          echo "HTTP Status: $http_code"
-          echo "Response: $body"
-          
-          if [ "$http_code" -ge 400 ]; then
-            echo "::error::Profile update failed with HTTP $http_code"
+          accounts=$(curl -sf --max-time 90 "$BASE_URL/api/auth/accounts" | jq -r '.accounts[]' || true)
+          if [ -z "$accounts" ]; then
+            echo "::error::Could not list accounts (backend down, or no session seeded)."
             exit 1
           fi
-          
-          echo "✅ Profile updated successfully"
+
+          failed=0
+          for account in $accounts; do
+            echo "=== Updating Naukri profile: $account ==="
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+              "$BASE_URL/api/profile/update" \
+              -H "Content-Type: application/json" \
+              -d "{\"provider\":\"naukri\",\"account\":\"$account\",\"trigger\":\"CRON\",\"dryRun\":false}" \
+              --max-time 60 || true)
+
+            http_code=$(echo "$response" | tail -1)
+            body=$(echo "$response" | head -n -1)
+            echo "HTTP Status: $http_code"
+            echo "Response: $body"
+
+            # 000 = no response at all (timeout / connection refused).
+            if [ "$http_code" = "000" ] || [ "$http_code" -ge 400 ]; then
+              echo "::error::Profile update failed for $account with HTTP $http_code"
+              failed=1
+            else
+              echo "✅ Profile updated: $account"
+            fi
+          done
+          exit $failed

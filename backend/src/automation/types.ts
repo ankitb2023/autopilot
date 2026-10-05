@@ -23,6 +23,15 @@ export type ProviderId = (typeof PROVIDER_IDS)[number];
 export const AUTOMATION_ACTIONS = ['profile.update'] as const;
 export type AutomationAction = (typeof AUTOMATION_ACTIONS)[number];
 
+/**
+ * Which of the user's accounts on a provider a run targets. One person can hold
+ * several (e.g. two Naukri profiles); each has its own session and its own lock.
+ * Requests that name no account get `default`, so single-account callers are
+ * unaffected.
+ */
+export const DEFAULT_ACCOUNT = 'default';
+export const ACCOUNT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
 /** Who asked for this run. Cron runs are worth distinguishing in history. */
 export const TRIGGER_SOURCES = ['API', 'CRON', 'MANUAL'] as const;
 export type TriggerSource = (typeof TRIGGER_SOURCES)[number];
@@ -39,6 +48,7 @@ export type TriggerSource = (typeof TRIGGER_SOURCES)[number];
 export interface ExecutionContext {
   readonly executionId: string;
   readonly provider: ProviderId;
+  readonly account: string;
   readonly action: AutomationAction;
   readonly trigger: TriggerSource;
   /** When true, the worker performs read-only steps and mutates nothing. */
@@ -75,6 +85,7 @@ export type WorkerFactory = () => AutomationWorker;
 /** The request the service acts on, independent of transport. */
 export interface ExecutionRequest {
   readonly provider: ProviderId;
+  readonly account: string;
   readonly action: AutomationAction;
   readonly trigger: TriggerSource;
   readonly dryRun: boolean;
@@ -84,6 +95,7 @@ export interface ExecutionRequest {
 export interface ExecutionResult {
   readonly executionId: string;
   readonly provider: ProviderId;
+  readonly account: string;
   readonly action: AutomationAction;
   readonly trigger: TriggerSource;
   readonly status: 'SUCCESS' | 'FAILED';

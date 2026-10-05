@@ -9,12 +9,11 @@ import { prisma } from '../../config/prisma';
  * hands back after OTP verification (device trust, refresh credentials, session ids)
  * has to be captured and replayed, or it is lost the moment the response is read.
  *
- * Scope is intentionally small: one host, one account, echo cookies back. No Path or
- * Domain matching, no RFC 6265 completeness — those matter for a browser talking to
- * many origins, not for us talking to naukri.com.
+ * Scope is intentionally small: one host, echo cookies back. No Path or Domain
+ * matching, no RFC 6265 completeness — those matter for a browser talking to many
+ * origins, not for us talking to naukri.com. There is one jar per account, keyed by
+ * the account id.
  */
-
-const SESSION_ID = 'default';
 
 export type CookieJar = Record<string, string>;
 
@@ -28,22 +27,31 @@ export type CookieJar = Record<string, string>;
  */
 export const ACCESS_TOKEN_COOKIE = 'nauk_at';
 
-export async function loadCookieJar(): Promise<CookieJar> {
-  const row = await prisma.naukriSession.findUnique({ where: { id: SESSION_ID } });
+export async function loadCookieJar(account: string): Promise<CookieJar> {
+  const row = await prisma.naukriSession.findUnique({ where: { id: account } });
   if (!row) return {};
   return (row.cookies ?? {}) as CookieJar;
 }
 
-export async function saveCookieJar(jar: CookieJar): Promise<void> {
+export async function saveCookieJar(account: string, jar: CookieJar): Promise<void> {
   await prisma.naukriSession.upsert({
-    where: { id: SESSION_ID },
-    create: { id: SESSION_ID, cookies: jar },
+    where: { id: account },
+    create: { id: account, cookies: jar },
     update: { cookies: jar },
   });
 }
 
-export async function clearCookieJar(): Promise<void> {
-  await prisma.naukriSession.deleteMany({ where: { id: SESSION_ID } });
+export async function clearCookieJar(account: string): Promise<void> {
+  await prisma.naukriSession.deleteMany({ where: { id: account } });
+}
+
+/** Every account with a stored session — the set the scheduled runs cover. */
+export async function listAccounts(): Promise<string[]> {
+  const rows = await prisma.naukriSession.findMany({
+    select: { id: true },
+    orderBy: { id: 'asc' },
+  });
+  return rows.map((row) => row.id);
 }
 
 /** Serialises the jar into a `Cookie:` request header, or undefined if empty. */

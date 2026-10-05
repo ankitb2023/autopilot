@@ -16,10 +16,11 @@ import { updateProfileSchema } from '../validation/automation.schema';
 
 /** POST /api/profile/update */
 export async function updateProfile(req: Request, res: Response): Promise<void> {
-  const { provider, trigger, dryRun } = updateProfileSchema.parse(req.body);
+  const { provider, account, trigger, dryRun } = updateProfileSchema.parse(req.body);
 
   const result = await executeAutomation({
     provider,
+    account,
     // The only action-specific knowledge this route contributes.
     action: 'profile.update',
     trigger,

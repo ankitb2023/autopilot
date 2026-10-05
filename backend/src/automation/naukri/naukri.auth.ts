@@ -2,6 +2,7 @@ import { env } from '../../config/env';
 import type { Logger } from '../../config/logger';
 import { prisma } from '../../config/prisma';
 import { AppError, toError } from '../../core/errors';
+import { DEFAULT_ACCOUNT } from '../types';
 import {
   loadCookieJar,
   mergeSetCookies,
@@ -84,11 +85,24 @@ const USER_AGENT =
 export class NaukriReauthRequiredError extends AppError {
   constructor(detail: string) {
     super(
-      `Naukri re-authentication required: ${detail} Run POST /api/auth/init-login, then POST /api/auth/verify-otp with the emailed code.`,
+      `Naukri re-authentication required: ${detail} Re-seed browser cookies with POST /api/auth/session, or run POST /api/auth/init-login then POST /api/auth/verify-otp with the emailed code.`,
       503,
       'NAUKRI_REAUTH_REQUIRED',
     );
   }
+}
+
+/**
+ * Password credentials for an account.
+ *
+ * Only the default account has any: NAUKRI_EMAIL/NAUKRI_PASSWORD predate multiple
+ * accounts. Every other account lives on seeded browser cookies alone, so its only
+ * re-authentication path is a fresh seed.
+ */
+function credentialsFor(account: string): { email?: string; password?: string } {
+  return account === DEFAULT_ACCOUNT
+    ? { email: env.NAUKRI_EMAIL, password: env.NAUKRI_PASSWORD }
+    : {};
 }
 
 /** Headers Naukri's gateway expects, matching their login layer's request shape. */
@@ -127,12 +141,15 @@ export interface LoginAttempt {
  * A 403 `MFA required` is the expected outcome from an unrecognised device; it means
  * Naukri has emailed a code and is waiting for `verifyMfaOtp`.
  */
-export async function attemptLogin(logger: Logger): Promise<LoginAttempt> {
-  if (!env.NAUKRI_EMAIL || !env.NAUKRI_PASSWORD) {
-    throw new NaukriReauthRequiredError('NAUKRI_EMAIL and NAUKRI_PASSWORD are not set.');
+export async function attemptLogin(logger: Logger, account: string): Promise<LoginAttempt> {
+  const { email, password } = credentialsFor(account);
+  if (!email || !password) {
+    throw new NaukriReauthRequiredError(
+      `no password credentials are configured for account "${account}".`,
+    );
   }
 
-  const jar = await loadCookieJar();
+  const jar = await loadCookieJar(account);
   const cookieHeader = toCookieHeader(jar);
 
   logger.info('naukri password login attempt', { replayedCookies: Object.keys(jar).length });
@@ -143,12 +160,12 @@ export async function attemptLogin(logger: Logger): Promise<LoginAttempt> {
       ...baseHeaders(LOGIN_SYSTEM_ID),
       ...(cookieHeader ? { cookie: cookieHeader } : {}),
     },
-    body: JSON.stringify({ username: env.NAUKRI_EMAIL, password: env.NAUKRI_PASSWORD }),
+    body: JSON.stringify({ username: email, password }),
   });
 
   // Persist cookies from every attempt, including the MFA challenge: it sets the
   // device and bot-manager cookies that the verification step is expected to echo.
-  await saveCookieJar(mergeSetCookies(jar, response.headers));
+  await saveCookieJar(account, mergeSetCookies(jar, response.headers));
 
   const body: unknown = await response.json().catch(() => ({}));
   const record = asRecord(body);
@@ -161,7 +178,7 @@ export async function attemptLogin(logger: Logger): Promise<LoginAttempt> {
       flowId: str(data.flowId),
       email: str(data.email),
       userId: str(data.userId),
-      username: str(data.username) ?? env.NAUKRI_EMAIL,
+      username: str(data.username) ?? email,
       status: response.status,
       body,
     };
@@ -169,7 +186,7 @@ export async function attemptLogin(logger: Logger): Promise<LoginAttempt> {
 
   if (!response.ok) return { mfaRequired: false, status: response.status, body };
 
-  return finishLogin(logger, record, response, 'password');
+  return finishLogin(logger, account, record, response, 'password');
 }
 
 /**
@@ -181,14 +198,15 @@ export async function attemptLogin(logger: Logger): Promise<LoginAttempt> {
  */
 export async function verifyMfaOtp(
   logger: Logger,
+  account: string,
   input: { token: string; flowId: string; username?: string },
 ): Promise<LoginAttempt> {
-  const username = input.username ?? env.NAUKRI_EMAIL;
+  const username = input.username ?? credentialsFor(account).email;
   if (!username) {
-    throw new NaukriReauthRequiredError('NAUKRI_EMAIL is not set.');
+    throw new NaukriReauthRequiredError(`no username is known for account "${account}"; pass one.`);
   }
 
-  const jar = await loadCookieJar();
+  const jar = await loadCookieJar(account);
   const cookieHeader = toCookieHeader(jar);
 
   logger.info('verifying naukri mfa otp', {
@@ -205,7 +223,7 @@ export async function verifyMfaOtp(
     body: JSON.stringify({ username, token: input.token, flowId: input.flowId }),
   });
 
-  await saveCookieJar(mergeSetCookies(jar, response.headers));
+  await saveCookieJar(account, mergeSetCookies(jar, response.headers));
 
   const body: unknown = await response.json().catch(() => ({}));
   const record = asRecord(body);
@@ -215,7 +233,7 @@ export async function verifyMfaOtp(
     return { mfaRequired: true, flowId: input.flowId, status: response.status, body };
   }
 
-  return finishLogin(logger, record, response, input.flowId);
+  return finishLogin(logger, account, record, response, input.flowId);
 }
 
 /**
@@ -226,10 +244,11 @@ export async function verifyMfaOtp(
  */
 export async function resendMfaOtp(
   logger: Logger,
+  account: string,
   input: { flowId: string; userId?: string; username?: string },
 ): Promise<{ status: number; body: unknown }> {
-  const username = input.username ?? env.NAUKRI_EMAIL;
-  const jar = await loadCookieJar();
+  const username = input.username ?? credentialsFor(account).email;
+  const jar = await loadCookieJar(account);
   const cookieHeader = toCookieHeader(jar);
 
   const response = await globalThis.fetch(RESEND_MFA_OTP_URL, {
@@ -241,7 +260,7 @@ export async function resendMfaOtp(
     body: JSON.stringify({ username, userId: input.userId, flowId: input.flowId }),
   });
 
-  await saveCookieJar(mergeSetCookies(jar, response.headers));
+  await saveCookieJar(account, mergeSetCookies(jar, response.headers));
   const body: unknown = await response.json().catch(() => ({}));
 
   logger.info('requested a new mfa otp', { status: response.status });
@@ -251,6 +270,7 @@ export async function resendMfaOtp(
 /** Shared tail of both login paths: pull out the token, store it, report back. */
 async function finishLogin(
   logger: Logger,
+  account: string,
   record: Record<string, unknown>,
   response: Response,
   obtainedVia: string,
@@ -265,7 +285,7 @@ async function finishLogin(
   }
 
   const expiresAt = readJwtExpiry(token);
-  await storeAccessToken(token, expiresAt, obtainedVia);
+  await storeAccessToken(account, token, expiresAt, obtainedVia);
 
   logger.info('naukri token obtained', { via: obtainedVia, expiresAt: expiresAt.toISOString() });
 
@@ -292,7 +312,7 @@ function str(value: unknown): string | undefined {
  * `loggedin: false` means the underlying session itself is dead — that is the one case
  * a human has to fix, and their frontend responds by redirecting to the login page.
  */
-export async function refreshCentralLogin(logger: Logger): Promise<string> {
+export async function refreshCentralLogin(logger: Logger, account: string): Promise<string> {
   /*
    * Retried, because this call fails transiently.
    *
@@ -309,7 +329,7 @@ export async function refreshCentralLogin(logger: Logger): Promise<string> {
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      return await attemptCentralLoginRefresh(logger);
+      return await attemptCentralLoginRefresh(logger, account);
     } catch (error) {
       lastError = error;
 
@@ -337,8 +357,8 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function attemptCentralLoginRefresh(logger: Logger): Promise<string> {
-  const jar = await loadCookieJar();
+async function attemptCentralLoginRefresh(logger: Logger, account: string): Promise<string> {
+  const jar = await loadCookieJar(account);
   const cookieHeader = toCookieHeader(jar);
 
   if (!cookieHeader) {
@@ -362,7 +382,7 @@ async function attemptCentralLoginRefresh(logger: Logger): Promise<string> {
   });
 
   const updatedJar = mergeSetCookies(jar, response.headers);
-  await saveCookieJar(updatedJar);
+  await saveCookieJar(account, updatedJar);
 
   const body = asRecord(await response.json().catch(() => ({})));
 
@@ -382,7 +402,7 @@ async function attemptCentralLoginRefresh(logger: Logger): Promise<string> {
   }
 
   const expiresAt = readJwtExpiry(token);
-  await storeAccessToken(token, expiresAt, 'central-login-refresh');
+  await storeAccessToken(account, token, expiresAt, 'central-login-refresh');
 
   logger.info('refreshed naukri token via central login', {
     expiresAt: expiresAt.toISOString(),
@@ -398,9 +418,12 @@ async function attemptCentralLoginRefresh(logger: Logger): Promise<string> {
  * token, then a cookie-only refresh, and password login solely as a last resort — that
  * one can trigger MFA, so it is not something to attempt casually on a schedule.
  */
-export async function getAccessToken(logger: Logger): Promise<string> {
+export async function getAccessToken(logger: Logger, account: string): Promise<string> {
   const stored = await prisma.naukriToken.findFirst({
-    where: { expiresAt: { gt: new Date(Date.now() + TOKEN_SAFETY_MARGIN_MS) } },
+    where: {
+      accountId: account,
+      expiresAt: { gt: new Date(Date.now() + TOKEN_SAFETY_MARGIN_MS) },
+    },
     // Newest first, not longest-lived first: a refresh issues a token with the same
     // one-hour lifetime as the one it replaces, so ordering by expiry can tie and hand
     // back the token we just superseded.
@@ -417,14 +440,14 @@ export async function getAccessToken(logger: Logger): Promise<string> {
   logger.info('no usable token; refreshing via central login');
 
   try {
-    return await refreshCentralLogin(logger);
+    return await refreshCentralLogin(logger, account);
   } catch (error) {
     if (!(error instanceof NaukriReauthRequiredError)) throw error;
 
     logger.warn('cookie refresh failed; falling back to password login', {
       reason: error.message,
     });
-    return refreshAccessToken(logger);
+    return refreshAccessToken(logger, account);
   }
 }
 
@@ -434,8 +457,8 @@ export async function getAccessToken(logger: Logger): Promise<string> {
  * Succeeds only if Naukri treats this caller as a known device. If it demands OTP,
  * that is a hard stop — we say so plainly instead of retrying into a lockout.
  */
-export async function refreshAccessToken(logger: Logger): Promise<string> {
-  const attempt = await attemptLogin(logger);
+export async function refreshAccessToken(logger: Logger, account: string): Promise<string> {
+  const attempt = await attemptLogin(logger, account);
 
   if (attempt.mfaRequired) {
     throw new NaukriReauthRequiredError(
@@ -454,11 +477,12 @@ export async function refreshAccessToken(logger: Logger): Promise<string> {
 
 /** Persists a token and drops expired rows so the table doesn't grow forever. */
 export async function storeAccessToken(
+  account: string,
   accessToken: string,
   expiresAt: Date,
   flowId: string | null,
 ): Promise<void> {
-  await prisma.naukriToken.create({ data: { accessToken, expiresAt, flowId } });
+  await prisma.naukriToken.create({ data: { accountId: account, accessToken, expiresAt, flowId } });
   await prisma.naukriToken.deleteMany({ where: { expiresAt: { lt: new Date() } } });
 }
 

@@ -2,6 +2,7 @@ import express from 'express';
 
 import { listProviders, updateProfile } from './controllers/automation.controller';
 import {
+  accounts,
   authStatus,
   initLogin,
   naukriProfile,
@@ -69,6 +70,9 @@ app.get('/api/naukri/profile', asyncHandler(naukriProfile));
  * Naukri auth. Interactive by necessity — an OTP needs a human — but the goal is to
  * need it once, after which stored cookies let the worker re-login silently.
  *
+ * Each route acts on one account, chosen with `?account=<id>` (default: `default`).
+ *
+ *   GET  /api/auth/accounts      every account with a stored session
  *   POST /api/auth/init-login    password login; returns MFA_REQUIRED or a token
  *   POST /api/auth/verify-otp    { otp, flowId } — completes MFA, captures cookies
  *   POST /api/auth/resend-otp    { flowId, userId? } — new code without a fresh login
@@ -79,6 +83,7 @@ app.get('/api/naukri/profile', asyncHandler(naukriProfile));
  *   POST /api/auth/session       seed the jar from browser cookies — skips OTP entirely
  *   DELETE /api/auth/session     drop a stale cookie jar
  */
+app.get('/api/auth/accounts', asyncHandler(accounts));
 app.post('/api/auth/init-login', asyncHandler(initLogin));
 app.post('/api/auth/verify-otp', asyncHandler(verifyOtp));
 app.post('/api/auth/resend-otp', asyncHandler(resendOtp));

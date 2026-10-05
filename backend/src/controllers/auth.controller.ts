@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
   clearCookieJar,
   cookieNames,
+  listAccounts,
   loadCookieJar,
   parseCookieHeader,
   readAccessTokenCookie,
@@ -22,6 +23,7 @@ import { fetchProfile } from '../automation/naukri/naukri.profile';
 import { logger } from '../config/logger';
 import { prisma } from '../config/prisma';
 import { AppError } from '../core/errors';
+import { accountSchema } from '../validation/automation.schema';
 
 /**
  * Naukri authentication endpoints.
@@ -29,7 +31,20 @@ import { AppError } from '../core/errors';
  * These exist for the one thing that cannot be automated: supplying an OTP. The goal
  * is to need them **once**. Every login here captures Naukri's full cookie jar, so a
  * later unattended re-login can present itself as the same known device.
+ *
+ * Every endpoint acts on one account, named by `?account=<id>`; omitted means
+ * `default`. Accounts come into being by seeding cookies for a new id.
  */
+
+/** The account a request targets, from `?account=`. */
+function accountOf(req: Request): string {
+  return accountSchema.parse(req.query.account);
+}
+
+/** GET /api/auth/accounts — every account with a stored session; the cron iterates this. */
+export async function accounts(_req: Request, res: Response): Promise<void> {
+  res.json({ accounts: await listAccounts() });
+}
 
 /**
  * POST /api/auth/init-login
@@ -37,8 +52,8 @@ import { AppError } from '../core/errors';
  * Tries a password-only login. If Naukri accepts it, we're done and no OTP was needed
  * — which is also the test for whether the device is now trusted.
  */
-export async function initLogin(_req: Request, res: Response): Promise<void> {
-  const attempt = await attemptLogin(logger);
+export async function initLogin(req: Request, res: Response): Promise<void> {
+  const attempt = await attemptLogin(logger, accountOf(req));
 
   if (attempt.mfaRequired) {
     res.status(200).json({
@@ -83,11 +98,16 @@ const verifyOtpSchema = z.object({
  */
 export async function verifyOtp(req: Request, res: Response): Promise<void> {
   const { otp, flowId, username } = verifyOtpSchema.parse(req.body);
+  const account = accountOf(req);
 
-  const attempt = await verifyMfaOtp(logger, { token: otp, flowId, ...(username ? { username } : {}) });
+  const attempt = await verifyMfaOtp(logger, account, {
+    token: otp,
+    flowId,
+    ...(username ? { username } : {}),
+  });
 
   if (attempt.accessToken) {
-    const jar = await loadCookieJar();
+    const jar = await loadCookieJar(account);
     res.json({
       status: 'SUCCESS',
       message: 'OTP verified and token stored.',
@@ -120,7 +140,7 @@ const resendSchema = z.object({
  */
 export async function resendOtp(req: Request, res: Response): Promise<void> {
   const input = resendSchema.parse(req.body);
-  const result = await resendMfaOtp(logger, input);
+  const result = await resendMfaOtp(logger, accountOf(req), input);
   res.status(result.status >= 400 ? 400 : 200).json({
     status: result.status >= 400 ? 'RESEND_FAILED' : 'RESENT',
     naukriResponse: result.body,
@@ -134,28 +154,32 @@ export async function resendOtp(req: Request, res: Response): Promise<void> {
  * and the same call Naukri's frontend makes on a 401. If this succeeds, unattended
  * operation works. A 503 means the stored session itself is dead and an OTP is needed.
  */
-export async function refresh(_req: Request, res: Response): Promise<void> {
-  const token = await refreshCentralLogin(logger);
+export async function refresh(req: Request, res: Response): Promise<void> {
+  const account = accountOf(req);
+  const token = await refreshCentralLogin(logger.child({ account }), account);
   res.json({
     status: 'REFRESHED',
+    account,
     message: 'Refreshed from session cookies — no password, no OTP. Unattended runs will work.',
     expiresAt: readJwtExpiry(token).toISOString(),
   });
 }
 
 /** GET /api/auth/status — token validity plus which cookies are held. */
-export async function authStatus(_req: Request, res: Response): Promise<void> {
+export async function authStatus(req: Request, res: Response): Promise<void> {
+  const account = accountOf(req);
   const [token, jar] = await Promise.all([
     prisma.naukriToken.findFirst({
-      where: { expiresAt: { gt: new Date() } },
+      where: { accountId: account, expiresAt: { gt: new Date() } },
       // Matches getAccessToken's ordering, so status reports the token actually in use.
       orderBy: { issuedAt: 'desc' },
       select: { issuedAt: true, expiresAt: true, flowId: true },
     }),
-    loadCookieJar(),
+    loadCookieJar(account),
   ]);
 
   res.json({
+    account,
     token: token
       ? {
           status: 'VALID',
@@ -186,7 +210,7 @@ export async function storeToken(req: Request, res: Response): Promise<void> {
     throw new AppError('That token has already expired.', 400, 'TOKEN_EXPIRED');
   }
 
-  await storeAccessToken(token, expiresAt, 'manual');
+  await storeAccessToken(accountOf(req), token, expiresAt, 'manual');
 
   res.json({
     status: 'STORED',
@@ -201,8 +225,8 @@ export async function storeToken(req: Request, res: Response): Promise<void> {
  * Drops the cookie jar. Needed when the stored cookies go stale — a jar holding a
  * dead session can make every login fail in ways a clean attempt would not.
  */
-export async function resetSession(_req: Request, res: Response): Promise<void> {
-  await clearCookieJar();
+export async function resetSession(req: Request, res: Response): Promise<void> {
+  await clearCookieJar(accountOf(req));
   res.json({ status: 'CLEARED', message: 'Cookie jar dropped. Next login starts fresh.' });
 }
 
@@ -225,14 +249,15 @@ const seedSessionSchema = z.object({
  */
 export async function seedSession(req: Request, res: Response): Promise<void> {
   const { cookie } = seedSessionSchema.parse(req.body);
+  const account = accountOf(req);
 
   const incoming = parseCookieHeader(cookie);
   if (Object.keys(incoming).length === 0) {
     throw new AppError('No cookies could be parsed from that value.', 400, 'NO_COOKIES_PARSED');
   }
 
-  const merged = { ...(await loadCookieJar()), ...incoming };
-  await saveCookieJar(merged);
+  const merged = { ...(await loadCookieJar(account)), ...incoming };
+  await saveCookieJar(account, merged);
 
   // If the paste included nauk_at it is already a usable bearer; register it so the
   // very next run works even before a refresh happens.
@@ -240,21 +265,22 @@ export async function seedSession(req: Request, res: Response): Promise<void> {
   if (token) {
     const expiresAt = readJwtExpiry(token);
     if (expiresAt.getTime() > Date.now()) {
-      await storeAccessToken(token, expiresAt, 'seeded');
+      await storeAccessToken(account, token, expiresAt, 'seeded');
     }
   }
 
   res.json({
     status: 'SEEDED',
+    account,
     cookiesHeld: cookieNames(merged),
     accessTokenFound: token !== undefined,
-    nextStep: 'POST /api/auth/refresh — if it returns REFRESHED, unattended runs work.',
+    nextStep: `POST /api/auth/refresh?account=${account} — if it returns REFRESHED, unattended runs work.`,
   });
 }
 
 /** GET /api/auth/probe — resolves a usable token the way the worker does. */
-export async function probe(_req: Request, res: Response): Promise<void> {
-  const token = await getAccessToken(logger);
+export async function probe(req: Request, res: Response): Promise<void> {
+  const token = await getAccessToken(logger, accountOf(req));
   res.json({ status: 'OK', expiresAt: readJwtExpiry(token).toISOString() });
 }
 
@@ -265,9 +291,10 @@ export async function probe(_req: Request, res: Response): Promise<void> {
  * NAUKRI_KEY_SKILLS and NAUKRI_PROFILE_ID must hold — and, because it is a genuine
  * authenticated call, proves whether the token works from this host's IP.
  */
-export async function naukriProfile(_req: Request, res: Response): Promise<void> {
-  const token = await getAccessToken(logger);
-  const snapshot = await fetchProfile(token, logger);
+export async function naukriProfile(req: Request, res: Response): Promise<void> {
+  const account = accountOf(req);
+  const token = await getAccessToken(logger, account);
+  const snapshot = await fetchProfile(token, account, logger);
 
   res.status(snapshot.ok ? 200 : 502).json({
     status: snapshot.ok ? 'OK' : 'FAILED',

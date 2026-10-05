@@ -31,6 +31,7 @@ export async function executeAutomation(request: ExecutionRequest): Promise<Exec
   const runLogger = logger.child({
     executionId,
     provider: request.provider,
+    account: request.account,
     action: request.action,
     trigger: request.trigger,
   });
@@ -88,6 +89,7 @@ export async function executeAutomation(request: ExecutionRequest): Promise<Exec
     const context: ExecutionContext = {
       executionId,
       provider: request.provider,
+      account: request.account,
       action: request.action,
       trigger: request.trigger,
       dryRun: request.dryRun,
@@ -106,6 +108,7 @@ export async function executeAutomation(request: ExecutionRequest): Promise<Exec
     return {
       executionId,
       provider: request.provider,
+      account: request.account,
       action: request.action,
       trigger: request.trigger,
       status: outcome.success ? 'SUCCESS' : 'FAILED',

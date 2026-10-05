@@ -123,6 +123,28 @@ retry, the work is already being done. It carries a `Retry-After` header.
 `{ "status": "ok", "uptimeSeconds": 42 }` — touches nothing, so a slow database can't get
 the container restarted mid-automation. Point Render's health check here.
 
+## Multiple Naukri accounts
+
+Every Naukri route takes an account id — `?account=<id>` on `/api/auth/*`, an
+`"account"` field on `POST /api/profile/update`. Omitted, it is `default`, so the
+original single-account setup is untouched.
+
+An account exists once it has a session. To add one, log into it in a separate browser
+profile and seed its cookies:
+
+```bash
+curl -X POST "$URL/api/auth/session?account=second" \
+  -H 'content-type: application/json' -d '{"cookie":"<Cookie header from DevTools>"}'
+curl -X POST "$URL/api/auth/refresh?account=second"   # expect REFRESHED
+```
+
+The scheduled workflow lists `GET /api/auth/accounts` and runs every account in turn, so
+nothing else changes. Each account has its own lock (`naukri:<id>`).
+
+Only `default` uses `NAUKRI_PROFILE_ID` / `NAUKRI_KEY_SKILLS` / the password login. Any
+other account reads its current profile id and skills live before each write and
+re-saves them unchanged; its only re-authentication path is a fresh cookie seed.
+
 ## Adding a provider
 
 1. `src/automation/workers/linkedin.worker.ts` implementing `AutomationWorker`.
